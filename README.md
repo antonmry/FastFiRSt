@@ -5,6 +5,8 @@ Workspace containing the Rust port of the FLASH "lowercase overhang" tool.
 - `flash-lib`: core library crate exposing the merge algorithm.
 - `flash-cli`: thin CLI wrapper that matches the original FLASH command-line
   flags and writes the three FASTQ outputs.
+- `flash-df`: scaffolding for running the merge pipeline through
+  DataFusion/Ballista (feature-gated stubs for now).
 
 ## Requirements
 
@@ -35,4 +37,36 @@ use flash_lib::{merge_fastq_files, CombineParams};
 
 let params = CombineParams::default();
 merge_fastq_files("input1.fq", "input2.fq", "./out", "out", &params)?;
+```
+
+## DataFusion/Ballista prototype
+
+The `flash-df` crate currently exposes a `FlashDistributedJob` wrapper that can
+execute the merge locally (re-using `flash-lib`) and provides feature-gated
+hooks for wiring the workflow into a `datafusion::SessionContext`. Enable the
+relevant feature flag when building:
+
+```bash
+cargo build -p flash-df --features datafusion
+```
+
+When the `datafusion` feature is enabled, `FlashDistributedJob` can register a
+`FastqTableProvider` that exposes paired FASTQ records as a tabular relation:
+
+```rust
+use flash_df::FlashDistributedJob;
+use flash_lib::{CombineParams, merge_fastq_files};
+
+let job = FlashDistributedJob::new(config, CombineParams::default());
+let ctx = job.session_context().await?;
+job.register_fastq_sources(&ctx).await?; // registers `flash_pairs` table
+let plan = job.build_logical_plan(&ctx).await?; // logical plan scanning the table
+```
+
+For a quick preview, run the bundled example:
+
+```bash
+cargo run -p flash-df --example query --features datafusion -- \
+  input1.fq input2.fq \
+  "SELECT tag1, seq1 FROM flash_pairs LIMIT 5"
 ```

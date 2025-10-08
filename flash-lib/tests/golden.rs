@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use flash_lib::{CombineParams, merge_fastq_files};
+use flash_lib::{CombineParams, FastqPairReader, merge_fastq_files};
 use tempfile::tempdir;
 
 #[test]
@@ -44,4 +44,33 @@ fn reproduces_flash_outputs_for_sample_pair() {
         fs::read(&produced_not2).unwrap(),
         fs::read(&expected_not2).unwrap()
     );
+}
+
+#[test]
+fn fastq_pair_reader_yields_expected_count() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data_dir = manifest_dir.join("../../FLASH-lowercase-overhang");
+
+    let input1 = data_dir.join("input1.fq");
+    let input2 = data_dir.join("input2.fq");
+
+    let mut reader =
+        FastqPairReader::from_paths(&input1, &input2, CombineParams::default().phred_offset)
+            .expect("pair reader should open files");
+    let mut count = 0usize;
+
+    while let Some(_) = reader
+        .next_pair()
+        .expect("pair reader iteration should succeed")
+    {
+        count += 1;
+    }
+
+    let expected_pairs = count_fastq_records(&input1);
+    assert_eq!(count, expected_pairs);
+}
+
+fn count_fastq_records(path: &PathBuf) -> usize {
+    let content = fs::read_to_string(path).expect("failed to read FASTQ");
+    content.lines().count() / 4
 }

@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -58,15 +58,83 @@ pub enum CombineStatus {
 }
 
 #[derive(Debug, Clone)]
-struct Read {
+pub struct FastqRecord {
     tag: String,
     seq: Vec<u8>,
     qual: Vec<u8>,
 }
 
-impl Read {
-    fn len(&self) -> usize {
+impl FastqRecord {
+    pub fn len(&self) -> usize {
         self.seq.len()
+    }
+
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    pub fn seq_bytes(&self) -> &[u8] {
+        &self.seq
+    }
+
+    pub fn qual_bytes(&self) -> &[u8] {
+        &self.qual
+    }
+
+    pub fn seq_string(&self) -> String {
+        String::from_utf8_lossy(&self.seq).into_owned()
+    }
+
+    pub fn qual_string(&self, phred_offset: u8) -> String {
+        let mut buf = Vec::with_capacity(self.qual.len());
+        for &q in &self.qual {
+            buf.push(q + phred_offset);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+pub struct FastqPairReader {
+    forward: BufReader<File>,
+    reverse: BufReader<File>,
+    forward_path: PathBuf,
+    reverse_path: PathBuf,
+    phred_offset: u8,
+}
+
+impl FastqPairReader {
+    pub fn from_paths(
+        forward: impl AsRef<Path>,
+        reverse: impl AsRef<Path>,
+        phred_offset: u8,
+    ) -> Result<Self> {
+        let forward_path = forward.as_ref().to_path_buf();
+        let reverse_path = reverse.as_ref().to_path_buf();
+        let forward_file = File::open(&forward_path)
+            .with_context(|| format!("failed to open forward FASTQ {:?}", forward_path))?;
+        let reverse_file = File::open(&reverse_path)
+            .with_context(|| format!("failed to open reverse FASTQ {:?}", reverse_path))?;
+
+        Ok(Self {
+            forward: BufReader::new(forward_file),
+            reverse: BufReader::new(reverse_file),
+            forward_path,
+            reverse_path,
+            phred_offset,
+        })
+    }
+
+    pub fn next_pair(&mut self) -> Result<Option<(FastqRecord, FastqRecord)>> {
+        let read1 = read_fastq_record(&mut self.forward, &self.forward_path, self.phred_offset)?;
+        let read2 = read_fastq_record(&mut self.reverse, &self.reverse_path, self.phred_offset)?;
+
+        match (read1, read2) {
+            (Some(r1), Some(r2)) => Ok(Some((r1, r2))),
+            (None, None) => Ok(None),
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("FASTQ inputs have different number of records")
+            }
+        }
     }
 }
 
@@ -98,14 +166,7 @@ pub fn merge_fastq_files(
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create output directory {:?}", output_dir))?;
 
-    let mut reader1 = BufReader::new(
-        File::open(forward)
-            .with_context(|| format!("failed to open forward FASTQ {:?}", forward))?,
-    );
-    let mut reader2 = BufReader::new(
-        File::open(reverse)
-            .with_context(|| format!("failed to open reverse FASTQ {:?}", reverse))?,
-    );
+    let mut pair_reader = FastqPairReader::from_paths(forward, reverse, params.phred_offset)?;
 
     let ext_path = output_dir.join(format!("{}.extendedFrags.fastq", output_prefix));
     let not1_path = output_dir.join(format!("{}.notCombined_1.fastq", output_prefix));
@@ -122,11 +183,8 @@ pub fn merge_fastq_files(
     );
 
     loop {
-        let read1 = read_fastq_record(&mut reader1, forward, params.phred_offset)?;
-        let read2 = read_fastq_record(&mut reader2, reverse, params.phred_offset)?;
-
-        match (read1, read2) {
-            (Some(r1), Some(r2)) => {
+        match pair_reader.next_pair()? {
+            Some((r1, r2)) => {
                 process_pair(
                     &r1,
                     &r2,
@@ -136,10 +194,7 @@ pub fn merge_fastq_files(
                     &mut out_not2,
                 )?;
             }
-            (None, None) => break,
-            (Some(_), None) | (None, Some(_)) => {
-                bail!("FASTQ inputs have different number of records")
-            }
+            None => break,
         }
     }
 
@@ -157,8 +212,8 @@ pub fn merge_fastq_files(
 }
 
 fn process_pair<W: Write>(
-    read1: &Read,
-    read2: &Read,
+    read1: &FastqRecord,
+    read2: &FastqRecord,
     params: &CombineParams,
     out_extended: &mut W,
     out_not1: &mut W,
@@ -182,7 +237,7 @@ fn read_fastq_record<R: BufRead>(
     reader: &mut R,
     source: &Path,
     phred_offset: u8,
-) -> Result<Option<Read>> {
+) -> Result<Option<FastqRecord>> {
     let mut tag_line = String::new();
     if reader.read_line(&mut tag_line)? == 0 {
         return Ok(None);
@@ -249,7 +304,7 @@ fn read_fastq_record<R: BufRead>(
         qual.push(byte.saturating_sub(phred_offset));
     }
 
-    Ok(Some(Read {
+    Ok(Some(FastqRecord {
         tag: tag_line,
         seq,
         qual,
@@ -291,7 +346,7 @@ fn to_lower(base: u8) -> u8 {
     }
 }
 
-fn reverse_complement(read: &mut Read) {
+fn reverse_complement(read: &mut FastqRecord) {
     let len = read.seq.len();
     for i in 0..(len / 2) {
         let j = len - 1 - i;
@@ -309,7 +364,11 @@ fn reverse_complement(read: &mut Read) {
     }
 }
 
-fn combine_pair(read1: &Read, read2_rev: &Read, params: &CombineParams) -> Option<Read> {
+fn combine_pair(
+    read1: &FastqRecord,
+    read2_rev: &FastqRecord,
+    params: &CombineParams,
+) -> Option<FastqRecord> {
     let mut best: Option<(AlignmentCandidate, CombineStatus)> =
         evaluate_alignment(read1, read2_rev, params)
             .map(|candidate| (candidate, CombineStatus::CombinedInnie));
@@ -344,8 +403,8 @@ fn combine_pair(read1: &Read, read2_rev: &Read, params: &CombineParams) -> Optio
 }
 
 fn evaluate_alignment(
-    first: &Read,
-    second: &Read,
+    first: &FastqRecord,
+    second: &FastqRecord,
     params: &CombineParams,
 ) -> Option<AlignmentCandidate> {
     if first.len() < params.min_overlap {
@@ -445,11 +504,11 @@ fn compute_mismatch_stats(
 }
 
 fn generate_combined_read(
-    read1: &Read,
-    read2: &Read,
+    read1: &FastqRecord,
+    read2: &FastqRecord,
     overlap_begin: usize,
     params: &CombineParams,
-) -> Read {
+) -> FastqRecord {
     let overlap_len = read1.len() - overlap_begin;
     let remaining_len = read2.len().saturating_sub(overlap_len);
     let combined_len = read1.len() + remaining_len;
@@ -508,14 +567,14 @@ fn generate_combined_read(
         qual.push(read2.qual[idx]);
     }
 
-    Read {
+    FastqRecord {
         tag: String::new(),
         seq,
         qual,
     }
 }
 
-fn combined_tag(read1: &Read) -> String {
+fn combined_tag(read1: &FastqRecord) -> String {
     let tag = &read1.tag;
     if let Some(pos) = tag.rfind('/') {
         if pos + 2 < tag.len() && tag.as_bytes()[pos + 2] == b'#' {
@@ -528,7 +587,7 @@ fn combined_tag(read1: &Read) -> String {
     }
 }
 
-fn write_fastq<W: Write>(writer: &mut W, read: &Read, phred_offset: u8) -> Result<()> {
+fn write_fastq<W: Write>(writer: &mut W, read: &FastqRecord, phred_offset: u8) -> Result<()> {
     writer
         .write_all(read.tag.as_bytes())
         .context("failed to write FASTQ tag")?;

@@ -30,5 +30,5 @@ notebooks/.ipynb_checkpoints/
 Agents.md
 
 # Tests
-
+*.fq
 out/
