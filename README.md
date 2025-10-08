@@ -1,10 +1,10 @@
 # flash_rs
 
-Rust rewrite of the FLASH "lowercase overhang" tool. The binary exposes the
-same core flags (`--min-overlap`, `--max-overlap`, `--max-mismatch-density`,
-`--allow-outies`, `--cap-mismatch-quals`, `--lowercase-overhang`,
-`--phred-offset`) and produces the same three FASTQ outputs as the original C
-implementation.
+Workspace containing the Rust port of the FLASH "lowercase overhang" tool.
+
+- `flash-lib`: core library crate exposing the merge algorithm.
+- `flash-cli`: thin CLI wrapper that matches the original FLASH command-line
+  flags and writes the three FASTQ outputs.
 
 ## Requirements
 
@@ -13,18 +13,26 @@ implementation.
 ## Build
 
 ```bash
-cargo build --release
+cargo build --release --workspace
 ```
 
 ## Usage
 
 ```bash
-cargo run --release -- READ1.fq READ2.fq \
+cargo run --release --bin flash-cli -- READ1.fq READ2.fq \
   --output-dir output_dir [--output-prefix out]
 ```
 
 Outputs are written to `<prefix>.extendedFrags.fastq`,
 `<prefix>.notCombined_1.fastq`, and `<prefix>.notCombined_2.fastq` in the given
 directory. Optional parameters default to the FLASH values; run
-`cargo run -- --help` for the full list.
+`cargo run --bin flash-cli -- --help` for the full list.
 
+## Library usage
+
+```rust
+use flash_lib::{merge_fastq_files, CombineParams};
+
+let params = CombineParams::default();
+merge_fastq_files("input1.fq", "input2.fq", "./out", "out", &params)?;
+```

@@ -3,16 +3,17 @@
 ## Context
 - Goal: migrate FastFiRSt to Rust using Apache DataFusion/Ballista while
   maintaining compatibility with the original FLASH outputs.
-- Current focus: standalone Rust CLI that mirrors the FLASH lowercase-overhang
-  behaviour.
+- Current focus: clean separation between reusable library code and CLI entry
+  point to prepare for future integrations.
 
 ## Snapshot (2024-09-26)
-- Implemented FASTQ parser, reverse-complement logic, overlap scoring, and
-  merged-read generation in Rust.
-- CLI reproduces FLASH outputs exactly for `input1.fq`/`input2.fq` test pair.
-- Docs: `README.md` describes build/use; this log summarises progress.
+- Restructured the Rust work into a cargo workspace: `flash-lib` (library) and
+  `flash-cli` (binary).
+- `flash-lib` exports `merge_fastq_files` and `CombineParams`; golden test uses
+  the upstream FLASH outputs for regression coverage.
+- CLI now depends on the library and keeps parity with the C tool's arguments.
+- README updated with workspace instructions and library usage example.
 
 ## Pending
-- Extend CLI tests/automation if needed.
-- Plan integration with DataFusion/Ballista pipeline in upcoming steps.
-
+- Consider richer unit coverage inside `flash-lib` beyond the golden test.
+- Start sketching DataFusion/Ballista adapters that consume `flash-lib`.

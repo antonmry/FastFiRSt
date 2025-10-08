@@ -1,100 +1,58 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Args, Parser};
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    run(cli)
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Rust port of the FLASH paired-end read merger."
-)]
-struct Cli {
-    /// Forward input FASTQ file
-    #[arg(value_name = "READ1")]
-    forward: PathBuf,
-
-    /// Reverse input FASTQ file
-    #[arg(value_name = "READ2")]
-    reverse: PathBuf,
-
-    #[command(flatten)]
-    params: CombineArgs,
-
-    /// Output directory (defaults to current working directory)
-    #[arg(long, value_name = "DIR", default_value = ".")]
-    output_dir: PathBuf,
-
-    /// Output prefix (defaults to `out`, matching FLASH)
-    #[arg(long, value_name = "PREFIX", default_value = "out")]
-    output_prefix: String,
-}
-
-#[derive(Args, Debug, Clone)]
-struct CombineArgs {
-    /// Minimum overlap length
-    #[arg(short = 'm', long = "min-overlap", default_value_t = 10)]
-    min_overlap: usize,
-
-    /// Maximum overlap length used for scoring
-    #[arg(short = 'M', long = "max-overlap", default_value_t = 65)]
-    max_overlap: usize,
-
-    /// Maximum allowed mismatch density
-    #[arg(short = 'x', long = "max-mismatch-density", default_value_t = 0.25)]
-    max_mismatch_density: f32,
-
-    /// Cap mismatch qualities at 2 (legacy behaviour)
-    #[arg(long = "cap-mismatch-quals", default_value_t = false)]
-    cap_mismatch_quals: bool,
-
-    /// Allow "outie" orientation mergers
-    #[arg(short = 'O', long = "allow-outies", default_value_t = false)]
-    allow_outies: bool,
-
-    /// Lowercase the non-overlapped overhangs in the merged read
-    #[arg(long = "lowercase-overhang", default_value_t = false)]
-    lowercase_overhang: bool,
-
-    /// PHRED offset (usually 33 or 64)
-    #[arg(short = 'p', long = "phred-offset", default_value_t = 33)]
-    phred_offset: u8,
-}
 
 #[derive(Debug, Clone)]
-struct CombineParams {
-    min_overlap: usize,
-    max_overlap: usize,
-    max_mismatch_density: f32,
-    cap_mismatch_quals: bool,
-    allow_outies: bool,
-    lowercase_overhang: bool,
-    phred_offset: u8,
+pub struct CombineParams {
+    pub min_overlap: usize,
+    pub max_overlap: usize,
+    pub max_mismatch_density: f32,
+    pub cap_mismatch_quals: bool,
+    pub allow_outies: bool,
+    pub lowercase_overhang: bool,
+    pub phred_offset: u8,
 }
 
-impl From<CombineArgs> for CombineParams {
-    fn from(args: CombineArgs) -> Self {
+impl Default for CombineParams {
+    fn default() -> Self {
         Self {
-            min_overlap: args.min_overlap,
-            max_overlap: args.max_overlap,
-            max_mismatch_density: args.max_mismatch_density,
-            cap_mismatch_quals: args.cap_mismatch_quals,
-            allow_outies: args.allow_outies,
-            lowercase_overhang: args.lowercase_overhang,
-            phred_offset: args.phred_offset,
+            min_overlap: 10,
+            max_overlap: 65,
+            max_mismatch_density: 0.25,
+            cap_mismatch_quals: false,
+            allow_outies: false,
+            lowercase_overhang: false,
+            phred_offset: 33,
         }
     }
 }
 
+impl CombineParams {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.min_overlap >= 1, "min-overlap must be >= 1");
+        ensure!(self.max_overlap >= 1, "max-overlap must be >= 1");
+        ensure!(
+            self.max_overlap >= self.min_overlap,
+            "max-overlap ({}) cannot be less than min-overlap ({})",
+            self.max_overlap,
+            self.min_overlap
+        );
+        ensure!(
+            self.max_mismatch_density >= 0.0,
+            "max-mismatch-density must be non-negative"
+        );
+        ensure!(
+            self.phred_offset <= 127,
+            "phred-offset must be in the range [0, 127]"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CombineStatus {
+pub enum CombineStatus {
     CombinedInnie,
     CombinedOutie,
 }
@@ -124,32 +82,34 @@ struct MismatchStats {
     mismatch_qual_total: u32,
 }
 
-fn run(cli: Cli) -> Result<()> {
-    let params: CombineParams = cli.params.clone().into();
-    validate_params(&params)?;
+pub fn merge_fastq_files(
+    forward: impl AsRef<Path>,
+    reverse: impl AsRef<Path>,
+    output_dir: impl AsRef<Path>,
+    output_prefix: &str,
+    params: &CombineParams,
+) -> Result<()> {
+    params.validate()?;
 
-    fs::create_dir_all(&cli.output_dir)
-        .with_context(|| format!("failed to create output directory {:?}", cli.output_dir))?;
+    let forward = forward.as_ref();
+    let reverse = reverse.as_ref();
+    let output_dir = output_dir.as_ref();
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create output directory {:?}", output_dir))?;
 
     let mut reader1 = BufReader::new(
-        File::open(&cli.forward)
-            .with_context(|| format!("failed to open forward FASTQ {:?}", cli.forward))?,
+        File::open(forward)
+            .with_context(|| format!("failed to open forward FASTQ {:?}", forward))?,
     );
     let mut reader2 = BufReader::new(
-        File::open(&cli.reverse)
-            .with_context(|| format!("failed to open reverse FASTQ {:?}", cli.reverse))?,
+        File::open(reverse)
+            .with_context(|| format!("failed to open reverse FASTQ {:?}", reverse))?,
     );
 
-    let prefix = &cli.output_prefix;
-    let ext_path = cli
-        .output_dir
-        .join(format!("{}.extendedFrags.fastq", prefix));
-    let not1_path = cli
-        .output_dir
-        .join(format!("{}.notCombined_1.fastq", prefix));
-    let not2_path = cli
-        .output_dir
-        .join(format!("{}.notCombined_2.fastq", prefix));
+    let ext_path = output_dir.join(format!("{}.extendedFrags.fastq", output_prefix));
+    let not1_path = output_dir.join(format!("{}.notCombined_1.fastq", output_prefix));
+    let not2_path = output_dir.join(format!("{}.notCombined_2.fastq", output_prefix));
 
     let mut out_extended = BufWriter::new(
         File::create(&ext_path).with_context(|| format!("failed to create {:?}", ext_path))?,
@@ -162,15 +122,15 @@ fn run(cli: Cli) -> Result<()> {
     );
 
     loop {
-        let read1 = read_fastq_record(&mut reader1, &cli.forward, params.phred_offset)?;
-        let read2 = read_fastq_record(&mut reader2, &cli.reverse, params.phred_offset)?;
+        let read1 = read_fastq_record(&mut reader1, forward, params.phred_offset)?;
+        let read2 = read_fastq_record(&mut reader2, reverse, params.phred_offset)?;
 
         match (read1, read2) {
             (Some(r1), Some(r2)) => {
                 process_pair(
                     &r1,
                     &r2,
-                    &params,
+                    params,
                     &mut out_extended,
                     &mut out_not1,
                     &mut out_not2,
@@ -207,7 +167,7 @@ fn process_pair<W: Write>(
     let mut read2_rev = read2.clone();
     reverse_complement(&mut read2_rev);
 
-    if let Some((mut combined, _status)) = combine_pair(read1, &read2_rev, params) {
+    if let Some(mut combined) = combine_pair(read1, &read2_rev, params) {
         combined.tag = combined_tag(read1);
         write_fastq(out_extended, &combined, params.phred_offset)?;
     } else {
@@ -349,11 +309,7 @@ fn reverse_complement(read: &mut Read) {
     }
 }
 
-fn combine_pair(
-    read1: &Read,
-    read2_rev: &Read,
-    params: &CombineParams,
-) -> Option<(Read, CombineStatus)> {
+fn combine_pair(read1: &Read, read2_rev: &Read, params: &CombineParams) -> Option<Read> {
     let mut best: Option<(AlignmentCandidate, CombineStatus)> =
         evaluate_alignment(read1, read2_rev, params)
             .map(|candidate| (candidate, CombineStatus::CombinedInnie));
@@ -379,8 +335,12 @@ fn combine_pair(
         CombineStatus::CombinedInnie => (read1, read2_rev),
         CombineStatus::CombinedOutie => (read2_rev, read1),
     };
-    let combined = generate_combined_read(first, second, candidate.position, params);
-    Some((combined, status))
+    Some(generate_combined_read(
+        first,
+        second,
+        candidate.position,
+        params,
+    ))
 }
 
 fn evaluate_alignment(
@@ -402,10 +362,13 @@ fn evaluate_alignment(
     } else {
         0
     };
-    let end = first.len() - params.min_overlap + 1;
+    let end = first
+        .len()
+        .saturating_sub(params.min_overlap)
+        .saturating_add(1);
 
     for i in start..end {
-        let overlap_len = first.len() - i;
+        let overlap_len = first.len().saturating_sub(i);
         if overlap_len > second.len() {
             continue;
         }
@@ -588,22 +551,21 @@ fn write_fastq<W: Write>(writer: &mut W, read: &Read, phred_offset: u8) -> Resul
     Ok(())
 }
 
-fn validate_params(params: &CombineParams) -> Result<()> {
-    ensure!(params.min_overlap >= 1, "min-overlap must be >= 1");
-    ensure!(params.max_overlap >= 1, "max-overlap must be >= 1");
-    ensure!(
-        params.max_overlap >= params.min_overlap,
-        "max-overlap ({}) cannot be less than min-overlap ({})",
-        params.max_overlap,
-        params.min_overlap
-    );
-    ensure!(
-        params.max_mismatch_density >= 0.0,
-        "max-mismatch-density must be non-negative"
-    );
-    ensure!(
-        params.phred_offset <= 127,
-        "phred-offset must be in the range [0, 127]"
-    );
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_newline_removes_crlf() {
+        let mut s = String::from("TAG\r\n");
+        trim_newline(&mut s);
+        assert_eq!(s, "TAG");
+    }
+
+    #[test]
+    fn canonical_base_normalises_cases_and_unknowns() {
+        assert_eq!(canonical_base(b'a'), b'A');
+        assert_eq!(canonical_base(b'T'), b'T');
+        assert_eq!(canonical_base(b'!'), b'N');
+    }
 }
