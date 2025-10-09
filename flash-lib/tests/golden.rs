@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use flash_lib::{CombineParams, FastqPairReader, merge_fastq_files};
+use flash_lib::{CombineParams, FastqPairReader, combine_pair_from_strs, merge_fastq_files};
 use tempfile::tempdir;
 
 #[test]
@@ -68,6 +68,45 @@ fn fastq_pair_reader_yields_expected_count() {
 
     let expected_pairs = count_fastq_records(&input1);
     assert_eq!(count, expected_pairs);
+}
+
+#[test]
+fn combine_pair_from_strs_handles_row() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data_dir = manifest_dir.join("../../FLASH-lowercase-overhang");
+
+    let input1 = fs::read_to_string(data_dir.join("input1.fq")).expect("read input1");
+    let input2 = fs::read_to_string(data_dir.join("input2.fq")).expect("read input2");
+
+    let mut lines1 = input1.lines();
+    let mut lines2 = input2.lines();
+
+    let tag1 = lines1.next().unwrap();
+    let seq1 = lines1.next().unwrap();
+    let _ = lines1.next();
+    let qual1 = lines1.next().unwrap();
+
+    let tag2 = lines2.next().unwrap();
+    let seq2 = lines2.next().unwrap();
+    let _ = lines2.next();
+    let qual2 = lines2.next().unwrap();
+
+    let outcome = combine_pair_from_strs(
+        tag1,
+        seq1,
+        qual1,
+        tag2,
+        seq2,
+        qual2,
+        &CombineParams::default(),
+    )
+    .expect("combine outcome");
+
+    if outcome.is_combined {
+        assert!(outcome.combined_tag.is_some());
+        assert!(outcome.combined_seq.is_some());
+        assert!(outcome.combined_qual.is_some());
+    }
 }
 
 fn count_fastq_records(path: &PathBuf) -> usize {

@@ -65,12 +65,46 @@ pub struct FastqRecord {
 }
 
 impl FastqRecord {
+    pub fn from_strs(tag: &str, seq: &str, qual: &str, phred_offset: u8) -> Result<Self> {
+        ensure!(
+            seq.len() == qual.len(),
+            "sequence and quality lengths differ"
+        );
+
+        let mut seq_bytes = Vec::with_capacity(seq.len());
+        for &base in seq.as_bytes() {
+            seq_bytes.push(canonical_base(base));
+        }
+
+        let mut qual_bytes = Vec::with_capacity(qual.len());
+        for (idx, &byte) in qual.as_bytes().iter().enumerate() {
+            if phred_offset > 0 && byte < phred_offset {
+                bail!(
+                    "quality char below PHRED offset ({}) at position {}",
+                    phred_offset,
+                    idx
+                );
+            }
+            qual_bytes.push(byte.saturating_sub(phred_offset));
+        }
+
+        Ok(Self {
+            tag: tag.to_string(),
+            seq: seq_bytes,
+            qual: qual_bytes,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.seq.len()
     }
 
     pub fn tag(&self) -> &str {
         &self.tag
+    }
+
+    pub fn set_tag<S: Into<String>>(&mut self, tag: S) {
+        self.tag = tag.into();
     }
 
     pub fn seq_bytes(&self) -> &[u8] {
@@ -148,6 +182,48 @@ struct MismatchStats {
     effective_len: usize,
     mismatches: u32,
     mismatch_qual_total: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CombineOutcome {
+    pub is_combined: bool,
+    pub combined_tag: Option<String>,
+    pub combined_seq: Option<String>,
+    pub combined_qual: Option<String>,
+}
+
+pub fn combine_pair_from_strs(
+    tag1: &str,
+    seq1: &str,
+    qual1: &str,
+    tag2: &str,
+    seq2: &str,
+    qual2: &str,
+    params: &CombineParams,
+) -> Result<CombineOutcome> {
+    let read1 = FastqRecord::from_strs(tag1, seq1, qual1, params.phred_offset)?;
+    let read2 = FastqRecord::from_strs(tag2, seq2, qual2, params.phred_offset)?;
+
+    let mut read2_rev = read2.clone();
+    reverse_complement(&mut read2_rev);
+
+    if let Some(mut combined_record) = combine_pair(&read1, &read2_rev, params) {
+        let combined_tag = combined_tag(&read1);
+        combined_record.set_tag(combined_tag.clone());
+        Ok(CombineOutcome {
+            is_combined: true,
+            combined_tag: Some(combined_tag),
+            combined_seq: Some(combined_record.seq_string()),
+            combined_qual: Some(combined_record.qual_string(params.phred_offset)),
+        })
+    } else {
+        Ok(CombineOutcome {
+            is_combined: false,
+            combined_tag: None,
+            combined_seq: None,
+            combined_qual: None,
+        })
+    }
 }
 
 pub fn merge_fastq_files(

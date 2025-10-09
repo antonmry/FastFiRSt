@@ -70,3 +70,10 @@ cargo run -p flash-df --example query --features datafusion -- \
   input1.fq input2.fq \
   "SELECT tag1, seq1 FROM flash_pairs LIMIT 5"
 ```
+
+To see the derived FLASH stages built with the custom UDFs:
+
+```bash
+cargo run -p flash-df --example flash_udf --features datafusion -- \
+  input1.fq input2.fq 5
+```

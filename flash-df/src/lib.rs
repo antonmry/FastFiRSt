@@ -8,13 +8,56 @@
 //! distributed execution wiring.
 
 use anyhow::Result;
+#[cfg(feature = "datafusion")]
+use flash_lib::combine_pair_from_strs;
 use flash_lib::{CombineParams, merge_fastq_files};
 
 #[cfg(feature = "datafusion")]
 use anyhow::anyhow;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "datafusion")]
+use std::{any::Any, sync::Arc};
+
+#[cfg(feature = "datafusion")]
+use async_trait::async_trait;
+#[cfg(feature = "datafusion")]
+use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, StringBuilder};
+#[cfg(feature = "datafusion")]
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+#[cfg(feature = "datafusion")]
+use datafusion::arrow::record_batch::RecordBatch;
+#[cfg(feature = "datafusion")]
+use datafusion::catalog::Session;
+#[cfg(feature = "datafusion")]
+use datafusion::common::cast::as_string_array;
+#[cfg(feature = "datafusion")]
+use datafusion::datasource::{TableProvider, TableType};
+#[cfg(feature = "datafusion")]
+use datafusion::error::{DataFusionError, Result as DFResult};
+#[cfg(feature = "datafusion")]
+use datafusion::execution::context::SessionContext;
+#[cfg(feature = "datafusion")]
+use datafusion::logical_expr::{
+    Expr, LogicalPlan, ReturnTypeFunction, ScalarUDF, Signature, Volatility, col,
+};
+#[cfg(feature = "datafusion")]
+use datafusion::physical_plan::{
+    ExecutionPlan, functions::make_scalar_function, memory::MemoryExec,
+};
+#[cfg(feature = "datafusion")]
+use datafusion::prelude::SessionConfig;
+#[cfg(feature = "datafusion")]
 #[cfg(feature = "datafusion")]
 use flash_lib::FastqPairReader;
-use std::path::{Path, PathBuf};
+
+#[cfg(feature = "datafusion")]
+const FLASH_COMBINED_TAG_UDF: &str = "flash_combined_tag";
+#[cfg(feature = "datafusion")]
+const FLASH_COMBINED_SEQ_UDF: &str = "flash_combined_seq";
+#[cfg(feature = "datafusion")]
+const FLASH_COMBINED_QUAL_UDF: &str = "flash_combined_qual";
+#[cfg(feature = "datafusion")]
+const FLASH_IS_COMBINED_UDF: &str = "flash_is_combined";
 
 /// Configuration for a FLASH job, regardless of which execution backend is
 /// used.
@@ -82,34 +125,6 @@ impl FlashDistributedJob {
         )
     }
 }
-
-#[cfg(feature = "datafusion")]
-use std::any::Any;
-#[cfg(feature = "datafusion")]
-use std::sync::Arc;
-
-#[cfg(feature = "datafusion")]
-use async_trait::async_trait;
-#[cfg(feature = "datafusion")]
-use datafusion::arrow::array::{ArrayRef, StringBuilder};
-#[cfg(feature = "datafusion")]
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-#[cfg(feature = "datafusion")]
-use datafusion::arrow::record_batch::RecordBatch;
-#[cfg(feature = "datafusion")]
-use datafusion::catalog::Session;
-#[cfg(feature = "datafusion")]
-use datafusion::datasource::{TableProvider, TableType};
-#[cfg(feature = "datafusion")]
-use datafusion::error::{DataFusionError, Result as DFResult};
-#[cfg(feature = "datafusion")]
-use datafusion::execution::context::SessionContext;
-#[cfg(feature = "datafusion")]
-use datafusion::logical_expr::{Expr, LogicalPlan};
-#[cfg(feature = "datafusion")]
-use datafusion::physical_plan::{ExecutionPlan, memory::MemoryExec};
-#[cfg(feature = "datafusion")]
-use datafusion::prelude::SessionConfig;
 
 #[cfg(feature = "datafusion")]
 const FASTQ_TABLE_NAME: &str = "flash_pairs";
@@ -252,6 +267,7 @@ impl FlashDistributedJob {
         let provider = Arc::new(self.fastq_table_provider());
         ctx.register_table(FASTQ_TABLE_NAME, provider)
             .map_err(|e| anyhow!(e.to_string()))?;
+        self.ensure_flash_udfs(ctx)?;
         Ok(())
     }
 
@@ -267,6 +283,244 @@ impl FlashDistributedJob {
             .map_err(|e| anyhow!(e.to_string()))?;
         Ok(plan)
     }
+
+    /// Build logical plans that produce combined reads and the two not-combined
+    /// FASTQ outputs, emulating FLASH's stages.
+    pub async fn build_flash_plans(&self, ctx: &SessionContext) -> Result<FlashPlans> {
+        self.ensure_flash_udfs(ctx)?;
+
+        let df = ctx
+            .table(FASTQ_TABLE_NAME)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+
+        let combined_df = df
+            .clone()
+            .filter(flash_bool_udf(self.params.clone()).call(flash_udf_args()))?
+            .select(vec![
+                flash_string_udf(
+                    FLASH_COMBINED_TAG_UDF,
+                    FlashStringField::Tag,
+                    self.params.clone(),
+                )
+                .call(flash_udf_args())
+                .alias("tag"),
+                flash_string_udf(
+                    FLASH_COMBINED_SEQ_UDF,
+                    FlashStringField::Seq,
+                    self.params.clone(),
+                )
+                .call(flash_udf_args())
+                .alias("seq"),
+                flash_string_udf(
+                    FLASH_COMBINED_QUAL_UDF,
+                    FlashStringField::Qual,
+                    self.params.clone(),
+                )
+                .call(flash_udf_args())
+                .alias("qual"),
+            ])?;
+
+        let not_expr = Expr::Not(Box::new(
+            flash_bool_udf(self.params.clone()).call(flash_udf_args()),
+        ));
+
+        let not_left_df = df.clone().filter(not_expr.clone())?.select(vec![
+            col("tag1").alias("tag"),
+            col("seq1").alias("seq"),
+            col("qual1").alias("qual"),
+        ])?;
+
+        let not_right_df = df.filter(not_expr)?.select(vec![
+            col("tag2").alias("tag"),
+            col("seq2").alias("seq"),
+            col("qual2").alias("qual"),
+        ])?;
+
+        Ok(FlashPlans {
+            combined: combined_df.into_optimized_plan()?,
+            not_combined_left: not_left_df.into_optimized_plan()?,
+            not_combined_right: not_right_df.into_optimized_plan()?,
+        })
+    }
+
+    fn ensure_flash_udfs(&self, ctx: &SessionContext) -> Result<()> {
+        ctx.register_udf(flash_string_udf(
+            FLASH_COMBINED_TAG_UDF,
+            FlashStringField::Tag,
+            self.params.clone(),
+        ));
+        ctx.register_udf(flash_string_udf(
+            FLASH_COMBINED_SEQ_UDF,
+            FlashStringField::Seq,
+            self.params.clone(),
+        ));
+        ctx.register_udf(flash_string_udf(
+            FLASH_COMBINED_QUAL_UDF,
+            FlashStringField::Qual,
+            self.params.clone(),
+        ));
+        ctx.register_udf(flash_bool_udf(self.params.clone()));
+        Ok(())
+    }
+}
+
+#[cfg(feature = "datafusion")]
+fn flash_udf_args() -> Vec<Expr> {
+    vec![
+        col("tag1"),
+        col("seq1"),
+        col("qual1"),
+        col("tag2"),
+        col("seq2"),
+        col("qual2"),
+    ]
+}
+
+#[cfg(feature = "datafusion")]
+#[derive(Clone, Copy)]
+enum FlashStringField {
+    Tag,
+    Seq,
+    Qual,
+}
+
+#[cfg(feature = "datafusion")]
+fn flash_string_udf(
+    name: &'static str,
+    field: FlashStringField,
+    params: CombineParams,
+) -> ScalarUDF {
+    let arg_types = vec![
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+    ];
+
+    let return_type: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Utf8)));
+
+    let params = Arc::new(params);
+    let fun = make_scalar_function(move |args: &[ArrayRef]| -> DFResult<ArrayRef> {
+        let tag1 = as_string_array(&args[0])?;
+        let seq1 = as_string_array(&args[1])?;
+        let qual1 = as_string_array(&args[2])?;
+        let tag2 = as_string_array(&args[3])?;
+        let seq2 = as_string_array(&args[4])?;
+        let qual2 = as_string_array(&args[5])?;
+
+        let len = tag1.len();
+        let mut builder = StringBuilder::new();
+
+        for i in 0..len {
+            if tag1.is_null(i)
+                || seq1.is_null(i)
+                || qual1.is_null(i)
+                || tag2.is_null(i)
+                || seq2.is_null(i)
+                || qual2.is_null(i)
+            {
+                builder.append_null();
+                continue;
+            }
+
+            let outcome = combine_pair_from_strs(
+                tag1.value(i),
+                seq1.value(i),
+                qual1.value(i),
+                tag2.value(i),
+                seq2.value(i),
+                qual2.value(i),
+                &params,
+            )
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+            let value = match field {
+                FlashStringField::Tag => outcome.combined_tag,
+                FlashStringField::Seq => outcome.combined_seq,
+                FlashStringField::Qual => outcome.combined_qual,
+            };
+
+            if let Some(v) = value {
+                builder.append_value(v);
+            } else {
+                builder.append_null();
+            }
+        }
+
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    });
+
+    let signature = Signature::exact(arg_types, Volatility::Immutable);
+    ScalarUDF::new(name, &signature, &return_type, &fun)
+}
+
+#[cfg(feature = "datafusion")]
+fn flash_bool_udf(params: CombineParams) -> ScalarUDF {
+    let arg_types = vec![
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+        DataType::Utf8,
+    ];
+
+    let return_type: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Boolean)));
+
+    let params = Arc::new(params);
+    let fun = make_scalar_function(move |args: &[ArrayRef]| -> DFResult<ArrayRef> {
+        let tag1 = as_string_array(&args[0])?;
+        let seq1 = as_string_array(&args[1])?;
+        let qual1 = as_string_array(&args[2])?;
+        let tag2 = as_string_array(&args[3])?;
+        let seq2 = as_string_array(&args[4])?;
+        let qual2 = as_string_array(&args[5])?;
+
+        let len = tag1.len();
+        let mut builder = BooleanBuilder::new();
+
+        for i in 0..len {
+            if tag1.is_null(i)
+                || seq1.is_null(i)
+                || qual1.is_null(i)
+                || tag2.is_null(i)
+                || seq2.is_null(i)
+                || qual2.is_null(i)
+            {
+                builder.append_value(false);
+                continue;
+            }
+
+            let outcome = combine_pair_from_strs(
+                tag1.value(i),
+                seq1.value(i),
+                qual1.value(i),
+                tag2.value(i),
+                seq2.value(i),
+                qual2.value(i),
+                &params,
+            )
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+            builder.append_value(outcome.is_combined);
+        }
+
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    });
+
+    let signature = Signature::exact(arg_types, Volatility::Immutable);
+    ScalarUDF::new(FLASH_IS_COMBINED_UDF, &signature, &return_type, &fun)
+}
+
+#[cfg(feature = "datafusion")]
+#[derive(Debug, Clone)]
+pub struct FlashPlans {
+    pub combined: LogicalPlan,
+    pub not_combined_left: LogicalPlan,
+    pub not_combined_right: LogicalPlan,
 }
 
 #[cfg(test)]
@@ -279,5 +533,57 @@ mod tests {
         let job = FlashDistributedJob::new(cfg.clone(), CombineParams::default());
         assert_eq!(job.config().forward, cfg.forward);
         assert_eq!(job.config().output_prefix, cfg.output_prefix);
+    }
+}
+
+#[cfg(all(test, feature = "datafusion"))]
+mod df_plan_tests {
+    use super::*;
+    use datafusion::arrow::array::StringArray;
+
+    #[tokio::test]
+    async fn flash_plans_align_with_reference_outputs() -> anyhow::Result<()> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let data_dir = manifest_dir.join("../../FLASH-lowercase-overhang");
+
+        let forward = data_dir.join("input1.fq");
+        let reverse = data_dir.join("input2.fq");
+
+        let job = FlashDistributedJob::new(
+            FlashJobConfig::new(&forward, &reverse, std::env::temp_dir(), "df_test"),
+            CombineParams::default(),
+        );
+
+        let ctx = job.session_context().await?;
+        job.register_fastq_sources(&ctx).await?;
+        let plans = job.build_flash_plans(&ctx).await?;
+
+        let combined_batches = ctx
+            .execute_logical_plan(plans.combined.clone())
+            .await?
+            .collect()
+            .await?;
+
+        assert!(!combined_batches.is_empty());
+        let combined_tags = combined_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(combined_tags.value(0), "@ERR188245.23");
+
+        let not_left_batches = ctx
+            .execute_logical_plan(plans.not_combined_left.clone())
+            .await?
+            .collect()
+            .await?;
+        let left_tags = not_left_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(left_tags.value(0), "@ERR188245.1");
+
+        Ok(())
     }
 }
