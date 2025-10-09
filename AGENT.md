@@ -17,17 +17,17 @@
   outputs for regression coverage.
 - `flash-df` wraps `FlashJobConfig`/`FlashDistributedJob`, offering a local
   fallback plus a basic `FastqTableProvider`, registration helpers for
-  DataFusion logical plans, and an example CLI
-  (`cargo run -p flash-df --example query --features datafusion ...`) for
-  interactive exploration. The crate now targets DataFusion 41.
+  DataFusion logical plans, and example CLIs for interactive exploration. The
+  crate now targets DataFusion 41 and implements the FLASH UDFs using
+  `ScalarUDFImpl`, eliminating the deprecated helper warnings.
 - CLI depends on the library and keeps parity with the C tool's arguments.
 - README updated with workspace instructions, library example, and feature-gated
   DataFusion notes.
 
 ## Pending
 
-- Flesh out the DataFusion logical plan so it mirrors FLASH's stages rather than
-  a thin table scan.
+- Flesh out the DataFusion logical plan so it mirrors FLASH's stages end-to-end
+  (the UDF scaffolding is in place, plan wiring still mirrors a table scan).
 - Implement the Ballista submission path and add integration tests once cluster
   wiring is available.
 - Consider richer unit coverage inside `flash-lib` beyond the golden test.

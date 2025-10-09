@@ -63,17 +63,19 @@ job.register_fastq_sources(&ctx).await?; // registers `flash_pairs` table
 let plan = job.build_logical_plan(&ctx).await?; // logical plan scanning the table
 ```
 
-For a quick preview, run the bundled example:
+For a quick preview, you can run the bundled example against the sample FASTQ
+files checked into the workspace root:
 
 ```bash
+# run an ad-hoc SQL query over the paired FASTQ rows
 cargo run -p flash-df --example query --features datafusion -- \
-  input1.fq input2.fq \
+  input1.fq \
+  input2.fq \
   "SELECT tag1, seq1 FROM flash_pairs LIMIT 5"
-```
 
-To see the derived FLASH stages built with the custom UDFs:
-
-```bash
+# exercise the FLASH UDFs that produce the combined and not-combined outputs
 cargo run -p flash-df --example flash_udf --features datafusion -- \
-  input1.fq input2.fq 5
+  input1.fq \
+  input2.fq \
+  5
 ```

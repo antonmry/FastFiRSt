@@ -37,16 +37,15 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 #[cfg(feature = "datafusion")]
 use datafusion::execution::context::SessionContext;
 #[cfg(feature = "datafusion")]
+use datafusion::logical_expr::ColumnarValue;
+#[cfg(feature = "datafusion")]
 use datafusion::logical_expr::{
-    Expr, LogicalPlan, ReturnTypeFunction, ScalarUDF, Signature, Volatility, col,
+    Expr, LogicalPlan, ScalarUDF, ScalarUDFImpl, Signature, Volatility, col,
 };
 #[cfg(feature = "datafusion")]
-use datafusion::physical_plan::{
-    ExecutionPlan, functions::make_scalar_function, memory::MemoryExec,
-};
+use datafusion::physical_plan::{ExecutionPlan, memory::MemoryExec};
 #[cfg(feature = "datafusion")]
 use datafusion::prelude::SessionConfig;
-#[cfg(feature = "datafusion")]
 #[cfg(feature = "datafusion")]
 use flash_lib::FastqPairReader;
 
@@ -378,7 +377,7 @@ fn flash_udf_args() -> Vec<Expr> {
 }
 
 #[cfg(feature = "datafusion")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum FlashStringField {
     Tag,
     Seq,
@@ -391,25 +390,73 @@ fn flash_string_udf(
     field: FlashStringField,
     params: CombineParams,
 ) -> ScalarUDF {
-    let arg_types = vec![
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-    ];
+    ScalarUDF::from(FlashStringUdf::new(name, field, params))
+}
 
-    let return_type: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Utf8)));
+#[cfg(feature = "datafusion")]
+fn flash_bool_udf(params: CombineParams) -> ScalarUDF {
+    ScalarUDF::from(FlashBoolUdf::new(params))
+}
 
-    let params = Arc::new(params);
-    let fun = make_scalar_function(move |args: &[ArrayRef]| -> DFResult<ArrayRef> {
-        let tag1 = as_string_array(&args[0])?;
-        let seq1 = as_string_array(&args[1])?;
-        let qual1 = as_string_array(&args[2])?;
-        let tag2 = as_string_array(&args[3])?;
-        let seq2 = as_string_array(&args[4])?;
-        let qual2 = as_string_array(&args[5])?;
+#[cfg(feature = "datafusion")]
+#[derive(Debug)]
+struct FlashStringUdf {
+    name: &'static str,
+    field: FlashStringField,
+    params: Arc<CombineParams>,
+    signature: Signature,
+}
+
+#[cfg(feature = "datafusion")]
+impl FlashStringUdf {
+    fn new(name: &'static str, field: FlashStringField, params: CombineParams) -> Self {
+        let signature = Signature::exact(vec![DataType::Utf8; 6], Volatility::Immutable);
+        Self {
+            name,
+            field,
+            params: Arc::new(params),
+            signature,
+        }
+    }
+}
+
+#[cfg(feature = "datafusion")]
+impl ScalarUDFImpl for FlashStringUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::common::Result<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(args)?;
+        if arrays.len() != 6 {
+            return Err(DataFusionError::Internal(
+                format!(
+                    "{} expects 6 arguments, received {}",
+                    self.name,
+                    arrays.len()
+                )
+                .into(),
+            ));
+        }
+
+        let tag1 = as_string_array(&arrays[0])?;
+        let seq1 = as_string_array(&arrays[1])?;
+        let qual1 = as_string_array(&arrays[2])?;
+        let tag2 = as_string_array(&arrays[3])?;
+        let seq2 = as_string_array(&arrays[4])?;
+        let qual2 = as_string_array(&arrays[5])?;
 
         let len = tag1.len();
         let mut builder = StringBuilder::new();
@@ -433,51 +480,82 @@ fn flash_string_udf(
                 tag2.value(i),
                 seq2.value(i),
                 qual2.value(i),
-                &params,
+                self.params.as_ref(),
             )
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(to_df_error)?;
 
-            let value = match field {
+            let value = match self.field {
                 FlashStringField::Tag => outcome.combined_tag,
                 FlashStringField::Seq => outcome.combined_seq,
                 FlashStringField::Qual => outcome.combined_qual,
             };
 
             if let Some(v) = value {
-                builder.append_value(v);
+                builder.append_value(&v);
             } else {
                 builder.append_null();
             }
         }
 
-        Ok(Arc::new(builder.finish()) as ArrayRef)
-    });
-
-    let signature = Signature::exact(arg_types, Volatility::Immutable);
-    ScalarUDF::new(name, &signature, &return_type, &fun)
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
 }
 
 #[cfg(feature = "datafusion")]
-fn flash_bool_udf(params: CombineParams) -> ScalarUDF {
-    let arg_types = vec![
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-        DataType::Utf8,
-    ];
+#[derive(Debug)]
+struct FlashBoolUdf {
+    params: Arc<CombineParams>,
+    signature: Signature,
+}
 
-    let return_type: ReturnTypeFunction = Arc::new(|_| Ok(Arc::new(DataType::Boolean)));
+#[cfg(feature = "datafusion")]
+impl FlashBoolUdf {
+    fn new(params: CombineParams) -> Self {
+        let signature = Signature::exact(vec![DataType::Utf8; 6], Volatility::Immutable);
+        Self {
+            params: Arc::new(params),
+            signature,
+        }
+    }
+}
 
-    let params = Arc::new(params);
-    let fun = make_scalar_function(move |args: &[ArrayRef]| -> DFResult<ArrayRef> {
-        let tag1 = as_string_array(&args[0])?;
-        let seq1 = as_string_array(&args[1])?;
-        let qual1 = as_string_array(&args[2])?;
-        let tag2 = as_string_array(&args[3])?;
-        let seq2 = as_string_array(&args[4])?;
-        let qual2 = as_string_array(&args[5])?;
+#[cfg(feature = "datafusion")]
+impl ScalarUDFImpl for FlashBoolUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        FLASH_IS_COMBINED_UDF
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::common::Result<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(args)?;
+        if arrays.len() != 6 {
+            return Err(DataFusionError::Internal(
+                format!(
+                    "{} expects 6 arguments, received {}",
+                    FLASH_IS_COMBINED_UDF,
+                    arrays.len()
+                )
+                .into(),
+            ));
+        }
+
+        let tag1 = as_string_array(&arrays[0])?;
+        let seq1 = as_string_array(&arrays[1])?;
+        let qual1 = as_string_array(&arrays[2])?;
+        let tag2 = as_string_array(&arrays[3])?;
+        let seq2 = as_string_array(&arrays[4])?;
+        let qual2 = as_string_array(&arrays[5])?;
 
         let len = tag1.len();
         let mut builder = BooleanBuilder::new();
@@ -501,18 +579,15 @@ fn flash_bool_udf(params: CombineParams) -> ScalarUDF {
                 tag2.value(i),
                 seq2.value(i),
                 qual2.value(i),
-                &params,
+                self.params.as_ref(),
             )
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(to_df_error)?;
 
             builder.append_value(outcome.is_combined);
         }
 
-        Ok(Arc::new(builder.finish()) as ArrayRef)
-    });
-
-    let signature = Signature::exact(arg_types, Volatility::Immutable);
-    ScalarUDF::new(FLASH_IS_COMBINED_UDF, &signature, &return_type, &fun)
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
 }
 
 #[cfg(feature = "datafusion")]
