@@ -3,6 +3,7 @@ members = [
     "flash-lib",
     "flash-cli",
     "flash-df",
+    "flash-wasm",
 ]
 resolver = "2"
 

@@ -1188,6 +1188,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "flash-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flash-lib",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "flatbuffers"
 version = "24.12.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
