@@ -21,7 +21,7 @@ use std::{any::Any, sync::Arc};
 #[cfg(feature = "datafusion")]
 use async_trait::async_trait;
 #[cfg(feature = "datafusion")]
-use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, StringBuilder};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, StringArray, StringBuilder};
 #[cfg(feature = "datafusion")]
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 #[cfg(feature = "datafusion")]
@@ -30,6 +30,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 #[cfg(feature = "datafusion")]
 use datafusion::common::cast::as_string_array;
+#[cfg(feature = "datafusion")]
+use datafusion::dataframe::DataFrame;
 #[cfg(feature = "datafusion")]
 use datafusion::datasource::{TableProvider, TableType};
 #[cfg(feature = "datafusion")]
@@ -48,6 +50,10 @@ use datafusion::physical_plan::{ExecutionPlan, memory::MemoryExec};
 use datafusion::prelude::SessionConfig;
 #[cfg(feature = "datafusion")]
 use flash_lib::FastqPairReader;
+#[cfg(feature = "datafusion")]
+use std::fs::{self, File};
+#[cfg(feature = "datafusion")]
+use std::io::{BufWriter, Write};
 
 #[cfg(feature = "datafusion")]
 const FLASH_COMBINED_TAG_UDF: &str = "flash_combined_tag";
@@ -57,6 +63,14 @@ const FLASH_COMBINED_SEQ_UDF: &str = "flash_combined_seq";
 const FLASH_COMBINED_QUAL_UDF: &str = "flash_combined_qual";
 #[cfg(feature = "datafusion")]
 const FLASH_IS_COMBINED_UDF: &str = "flash_is_combined";
+#[cfg(feature = "datafusion")]
+const IS_COMBINED_COL: &str = "is_combined";
+#[cfg(feature = "datafusion")]
+const COMBINED_TAG_COL: &str = "combined_tag";
+#[cfg(feature = "datafusion")]
+const COMBINED_SEQ_COL: &str = "combined_seq";
+#[cfg(feature = "datafusion")]
+const COMBINED_QUAL_COL: &str = "combined_qual";
 
 /// Configuration for a FLASH job, regardless of which execution backend is
 /// used.
@@ -270,59 +284,25 @@ impl FlashDistributedJob {
         Ok(())
     }
 
-    /// Build the logical plan that mirrors FLASH's merge stages. For now this
-    /// simply returns the plan that scans the registered table.
+    /// Build the logical plan that mirrors FLASH's merge stages by annotating
+    /// each FASTQ pair with the FLASH UDF outputs.
     pub async fn build_logical_plan(&self, ctx: &SessionContext) -> Result<LogicalPlan> {
-        let df = ctx
-            .table(FASTQ_TABLE_NAME)
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        let plan = df
-            .into_optimized_plan()
-            .map_err(|e| anyhow!(e.to_string()))?;
-        Ok(plan)
+        let df = self.annotated_fastq_df(ctx).await?;
+        df.into_optimized_plan().map_err(|e| anyhow!(e.to_string()))
     }
 
     /// Build logical plans that produce combined reads and the two not-combined
     /// FASTQ outputs, emulating FLASH's stages.
     pub async fn build_flash_plans(&self, ctx: &SessionContext) -> Result<FlashPlans> {
-        self.ensure_flash_udfs(ctx)?;
+        let df = self.annotated_fastq_df(ctx).await?;
 
-        let df = ctx
-            .table(FASTQ_TABLE_NAME)
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
+        let combined_df = df.clone().filter(col(IS_COMBINED_COL))?.select(vec![
+            col(COMBINED_TAG_COL).alias("tag"),
+            col(COMBINED_SEQ_COL).alias("seq"),
+            col(COMBINED_QUAL_COL).alias("qual"),
+        ])?;
 
-        let combined_df = df
-            .clone()
-            .filter(flash_bool_udf(self.params.clone()).call(flash_udf_args()))?
-            .select(vec![
-                flash_string_udf(
-                    FLASH_COMBINED_TAG_UDF,
-                    FlashStringField::Tag,
-                    self.params.clone(),
-                )
-                .call(flash_udf_args())
-                .alias("tag"),
-                flash_string_udf(
-                    FLASH_COMBINED_SEQ_UDF,
-                    FlashStringField::Seq,
-                    self.params.clone(),
-                )
-                .call(flash_udf_args())
-                .alias("seq"),
-                flash_string_udf(
-                    FLASH_COMBINED_QUAL_UDF,
-                    FlashStringField::Qual,
-                    self.params.clone(),
-                )
-                .call(flash_udf_args())
-                .alias("qual"),
-            ])?;
-
-        let not_expr = Expr::Not(Box::new(
-            flash_bool_udf(self.params.clone()).call(flash_udf_args()),
-        ));
+        let not_expr = Expr::Not(Box::new(col(IS_COMBINED_COL)));
 
         let not_left_df = df.clone().filter(not_expr.clone())?.select(vec![
             col("tag1").alias("tag"),
@@ -341,6 +321,148 @@ impl FlashDistributedJob {
             not_combined_left: not_left_df.into_optimized_plan()?,
             not_combined_right: not_right_df.into_optimized_plan()?,
         })
+    }
+
+    /// Execute the FLASH pipeline through DataFusion and materialise the three
+    /// FASTQ outputs.
+    pub async fn execute_datafusion(&self) -> Result<()> {
+        let ctx = self.session_context().await?;
+        self.register_fastq_sources(&ctx).await?;
+        let plans = self.build_flash_plans(&ctx).await?;
+        self.materialize_plans(&ctx, &plans).await
+    }
+
+    async fn annotated_fastq_df(&self, ctx: &SessionContext) -> Result<DataFrame> {
+        self.ensure_flash_udfs(ctx)?;
+
+        let df = ctx
+            .table(FASTQ_TABLE_NAME)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+
+        df.select(vec![
+            col("tag1"),
+            col("seq1"),
+            col("qual1"),
+            col("tag2"),
+            col("seq2"),
+            col("qual2"),
+            flash_bool_udf(self.params.clone())
+                .call(flash_udf_args())
+                .alias(IS_COMBINED_COL),
+            flash_string_udf(
+                FLASH_COMBINED_TAG_UDF,
+                FlashStringField::Tag,
+                self.params.clone(),
+            )
+            .call(flash_udf_args())
+            .alias(COMBINED_TAG_COL),
+            flash_string_udf(
+                FLASH_COMBINED_SEQ_UDF,
+                FlashStringField::Seq,
+                self.params.clone(),
+            )
+            .call(flash_udf_args())
+            .alias(COMBINED_SEQ_COL),
+            flash_string_udf(
+                FLASH_COMBINED_QUAL_UDF,
+                FlashStringField::Qual,
+                self.params.clone(),
+            )
+            .call(flash_udf_args())
+            .alias(COMBINED_QUAL_COL),
+        ])
+        .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn materialize_plans(&self, ctx: &SessionContext, plans: &FlashPlans) -> Result<()> {
+        fs::create_dir_all(&self.config.output_dir).map_err(|e| anyhow!(e.to_string()))?;
+
+        let (combined_path, not1_path, not2_path) = self.output_paths();
+
+        let combined_batches = self.collect_plan_batches(ctx, &plans.combined).await?;
+        self.write_fastq_batches(&combined_path, &combined_batches, 0, 1, 2)?;
+
+        let not1_batches = self
+            .collect_plan_batches(ctx, &plans.not_combined_left)
+            .await?;
+        self.write_fastq_batches(&not1_path, &not1_batches, 0, 1, 2)?;
+
+        let not2_batches = self
+            .collect_plan_batches(ctx, &plans.not_combined_right)
+            .await?;
+        self.write_fastq_batches(&not2_path, &not2_batches, 0, 1, 2)?;
+
+        Ok(())
+    }
+
+    async fn collect_plan_batches(
+        &self,
+        ctx: &SessionContext,
+        plan: &LogicalPlan,
+    ) -> Result<Vec<RecordBatch>> {
+        ctx.execute_logical_plan(plan.clone())
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?
+            .collect()
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    fn write_fastq_batches(
+        &self,
+        path: &Path,
+        batches: &[RecordBatch],
+        tag_idx: usize,
+        seq_idx: usize,
+        qual_idx: usize,
+    ) -> Result<()> {
+        let file = File::create(path).map_err(|e| anyhow!(e.to_string()))?;
+        let mut writer = BufWriter::new(file);
+
+        for batch in batches {
+            let tags = batch
+                .column(tag_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected UTF-8 tag column"))?;
+            let seqs = batch
+                .column(seq_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected UTF-8 sequence column"))?;
+            let quals = batch
+                .column(qual_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected UTF-8 quality column"))?;
+
+            for row in 0..batch.num_rows() {
+                if tags.is_null(row) || seqs.is_null(row) || quals.is_null(row) {
+                    continue;
+                }
+
+                writeln!(writer, "{}", tags.value(row)).map_err(|e| anyhow!(e.to_string()))?;
+                writeln!(writer, "{}", seqs.value(row)).map_err(|e| anyhow!(e.to_string()))?;
+                writer
+                    .write_all(b"+\n")
+                    .map_err(|e| anyhow!(e.to_string()))?;
+                writeln!(writer, "{}", quals.value(row)).map_err(|e| anyhow!(e.to_string()))?;
+            }
+        }
+
+        writer.flush().map_err(|e| anyhow!(e.to_string()))?;
+        Ok(())
+    }
+
+    fn output_paths(&self) -> (PathBuf, PathBuf, PathBuf) {
+        let prefix = &self.config.output_prefix;
+        let dir = &self.config.output_dir;
+        (
+            dir.join(format!("{}.extendedFrags.fastq", prefix)),
+            dir.join(format!("{}.notCombined_1.fastq", prefix)),
+            dir.join(format!("{}.notCombined_2.fastq", prefix)),
+        )
     }
 
     fn ensure_flash_udfs(&self, ctx: &SessionContext) -> Result<()> {
@@ -615,6 +737,8 @@ mod tests {
 mod df_plan_tests {
     use super::*;
     use datafusion::arrow::array::StringArray;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn flash_plans_align_with_reference_outputs() -> anyhow::Result<()> {
@@ -658,6 +782,35 @@ mod df_plan_tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(left_tags.value(0), "@ERR188245.1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn datafusion_outputs_match_cli_results() -> anyhow::Result<()> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let forward = manifest_dir.join("../input1.fq");
+        let reverse = manifest_dir.join("../input2.fq");
+        let tmp = tempdir()?;
+
+        let params = CombineParams::default();
+        merge_fastq_files(&forward, &reverse, tmp.path(), "ref", &params)?;
+
+        let df_job = FlashDistributedJob::new(
+            FlashJobConfig::new(&forward, &reverse, tmp.path(), "df"),
+            params,
+        );
+        df_job.execute_datafusion().await?;
+
+        for suffix in [
+            "extendedFrags.fastq",
+            "notCombined_1.fastq",
+            "notCombined_2.fastq",
+        ] {
+            let expected = fs::read(tmp.path().join(format!("ref.{suffix}")))?;
+            let actual = fs::read(tmp.path().join(format!("df.{suffix}")))?;
+            assert_eq!(actual, expected, "mismatch for {suffix}");
+        }
 
         Ok(())
     }

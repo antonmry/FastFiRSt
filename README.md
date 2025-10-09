@@ -60,7 +60,10 @@ use flash_lib::{CombineParams, merge_fastq_files};
 let job = FlashDistributedJob::new(config, CombineParams::default());
 let ctx = job.session_context().await?;
 job.register_fastq_sources(&ctx).await?; // registers `flash_pairs` table
-let plan = job.build_logical_plan(&ctx).await?; // logical plan scanning the table
+let plan = job.build_logical_plan(&ctx).await?; // logical plan with combined/not-combined annotations
+
+// Or execute the full pipeline via DataFusion and write the three FASTQ outputs
+job.execute_datafusion().await?;
 ```
 
 For a quick preview, you can run the bundled example against the sample FASTQ

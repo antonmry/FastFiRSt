@@ -1175,6 +1175,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "flash-lib",
+ "tempfile",
  "tokio",
 ]
 
