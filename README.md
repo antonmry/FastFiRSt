@@ -1,6 +1,7 @@
 # FastFiRSt
 
-Workspace containing the Rust port of the FLASH "lowercase overhang" tool.
+Workspace containing the Rust port of the [FLASH "lowercase overhang"
+tool](https://github.com/Jerrythafast/FLASH-lowercase-overhang).
 
 - `flash-lib`: core library crate exposing the merge algorithm.
 - `flash-cli`: thin CLI wrapper that matches the original FLASH command-line
@@ -14,15 +15,12 @@ Workspace containing the Rust port of the FLASH "lowercase overhang" tool.
 
 ## Installing the CLI
 
-The `flash-cli` binary is published on crates.io. Once a release is tagged and
-the publish workflow runs successfully, you can install it with:
+The `flash-cli` binary is published on
+[crates.io](https://crates.io/crates/flash-cli). You can install it with:
 
 ```bash
 cargo install flash-cli
 ```
-
-Updates are triggered manually via the `Publish flash-cli to crates.io` GitHub
-Action. Ensure the crate version is bumped before running the workflow.
 
 ## Requirements
 
@@ -47,6 +45,15 @@ directory. Optional parameters default to the FLASH values; run
 `cargo run --bin flash-cli -- --help` for the full list.
 
 ## Library usage
+
+It's also published in [crates.io](https://crates.io/crates/flash-cli). You
+can add it to your project with:
+
+```bash
+cargo add flash-lib
+```
+
+And use it:
 
 ```rust
 use flash_lib::{merge_fastq_files, CombineParams};
