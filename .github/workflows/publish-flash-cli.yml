@@ -6,6 +6,9 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flash_rs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,7 +21,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           set +e
-          output=$(cargo publish --manifest-path flash_rs/flash-lib/Cargo.toml --locked 2>&1)
+          output=$(cargo publish --manifest-path flash-lib/Cargo.toml --locked 2>&1)
           status=$?
           echo "$output"
           if [ $status -ne 0 ] && ! echo "$output" | grep -q "already uploaded"; then
@@ -31,7 +34,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           set +e
-          output=$(cargo publish --manifest-path flash_rs/flash-cli/Cargo.toml --locked 2>&1)
+          output=$(cargo publish --manifest-path flash-cli/Cargo.toml --locked 2>&1)
           status=$?
           echo "$output"
           if [ $status -ne 0 ] && ! echo "$output" | grep -q "already uploaded"; then
