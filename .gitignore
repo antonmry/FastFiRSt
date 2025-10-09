@@ -32,3 +32,4 @@ Agents.md
 # Tests
 *.fq
 out/
+/wasm-playground/.vite/
