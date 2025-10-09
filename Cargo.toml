@@ -9,3 +9,6 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
+
+[patch.crates-io]
+flash-lib = { path = "flash-lib" }

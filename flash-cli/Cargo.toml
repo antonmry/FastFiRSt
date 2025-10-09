@@ -2,8 +2,15 @@
 name = "flash-cli"
 version = "0.1.0"
 edition = "2024"
+description = "Command-line interface for the FLASH read merging algorithm"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/antonmry/FastFiRSt"
+homepage = "https://github.com/antonmry/FastFiRSt"
+keywords = ["flash", "fastq", "bioinformatics", "cli"]
+categories = ["command-line-utilities", "science"]
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-flash-lib = { path = "../flash-lib" }
+flash-lib = { version = "0.1.0" }

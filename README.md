@@ -1,4 +1,4 @@
-# flash_rs
+# FastFiRSt
 
 Workspace containing the Rust port of the FLASH "lowercase overhang" tool.
 
@@ -11,6 +11,18 @@ Workspace containing the Rust port of the FLASH "lowercase overhang" tool.
   the playground UI.
 - `wasm-playground`: Vite/Mantine web playground that can execute SQL queries
   against DataFusion and now run FLASH locally in the browser.
+
+## Installing the CLI
+
+The `flash-cli` binary is published on crates.io. Once a release is tagged and
+the publish workflow runs successfully, you can install it with:
+
+```bash
+cargo install flash-cli
+```
+
+Updates are triggered manually via the `Publish flash-cli to crates.io` GitHub
+Action. Ensure the crate version is bumped before running the workflow.
 
 ## Requirements
 
@@ -86,3 +98,30 @@ cargo run -p flash-df --example flash_udf --features datafusion -- \
   input2.fq \
   5
 ```
+
+## Website using WASM (Experimental)
+
+This playground bundles the Rust implementation of FLASH compiled to
+WebAssembly, so you can upload paired FASTQ files and inspect the merged results
+directly in the browser:
+
+1. Build the WebAssembly artefact from the workspace root:
+
+   ```bash
+   rustup target add wasm32-unknown-unknown # once per environment
+   cargo build -p flash-wasm --release --target wasm32-unknown-unknown
+   mkdir -p public
+   cp ../target/wasm32-unknown-unknown/release/flash_wasm.wasm public/
+   ```
+
+2. Start the playground (`pnpm dev`/`npm run dev`) and open the **FLASH Merge**
+   tab.
+   - In **FLASH Merge**, select your forward (`R1`) and reverse (`R2`) FASTQ
+     files, then click **Run FLASH** to view or download the merged outputs. The
+     uploader also registers four DataFusion views so you can query the results
+     directly:
+
+   - `flash_input_pairs` with the original paired reads.
+   - `flash_combined` with successfully merged reads.
+   - `flash_not_combined_left` / `flash_not_combined_right` mirroring FLASH's
+     not-combined outputs.

@@ -2,6 +2,13 @@
 name = "flash-lib"
 version = "0.1.0"
 edition = "2024"
+description = "Rust port of the FLASH read merging algorithm"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/antonmry/FastFiRSt"
+homepage = "https://github.com/antonmry/FastFiRSt"
+keywords = ["flash", "fastq", "bioinformatics"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 anyhow = "1"
