@@ -7,6 +7,10 @@ Workspace containing the Rust port of the FLASH "lowercase overhang" tool.
   flags and writes the three FASTQ outputs.
 - `flash-df`: scaffolding for running the merge pipeline through
   DataFusion/Ballista (feature-gated stubs for now).
+- `flash-wasm`: minimal WebAssembly interface exposing the FLASH merge logic for
+  the playground UI.
+- `wasm-playground`: Vite/Mantine web playground that can execute SQL queries
+  against DataFusion and now run FLASH locally in the browser.
 
 ## Requirements
 

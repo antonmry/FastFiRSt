@@ -22,6 +22,11 @@
   `ScalarUDFImpl`, builds annotated logical plans that align with the
   combined/not-combined FLASH stages, and can now materialise the DataFusion
   outputs back into the three FLASH FASTQ files.
+- `flash-wasm` exposes the FLASH pipeline to WebAssembly and the playground now
+  supports uploading FASTQs, streaming the outputs, and auto-registering
+  `flash_*` tables for interactive SQL queries. The Upload tab now offers both
+  the original dataset registration form and a dedicated FASTQ pair section; the
+  separate cloud credentials tab was removed.
 - CLI depends on the library and keeps parity with the C tool's arguments.
 - README updated with workspace instructions, library example, and feature-gated
   DataFusion notes.
