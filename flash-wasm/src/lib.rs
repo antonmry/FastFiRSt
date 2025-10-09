@@ -161,7 +161,7 @@ fn push_line(target: &mut String, line: &str) {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flash_alloc(len: usize) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(len);
     let ptr = buf.as_mut_ptr();
@@ -170,7 +170,7 @@ pub extern "C" fn flash_alloc(len: usize) -> *mut u8 {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flash_dealloc(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;
@@ -181,7 +181,7 @@ pub extern "C" fn flash_dealloc(ptr: *mut u8, len: usize) {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flash_run(
     forward_ptr: *const u8,
     forward_len: usize,
@@ -223,13 +223,13 @@ pub extern "C" fn flash_run(
 }
 
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flash_result_len() -> usize {
     unsafe { LAST_RESULT_LEN }
 }
 
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flash_free_result(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;

@@ -12,9 +12,9 @@ Playground of [Apache Arrow DataFusion](https://github.com/apache/arrow-datafusi
 
 ## Features
 
-- Cloud storage support: HTTP, AWS S3 (Google Cloud Storage and Azure Blob Storage are on the way)
-- Full functional DataFusion query engine.
-- Data formats: CSV, Parquet, JSON, Avro
+- Upload local CSV/JSON datasets (or point to remote files) and query them via SQL.
+- Experimental FLASH FASTQ merge powered by the Rust/WebAssembly port of flash-lib.
+- Full functional DataFusion query engine running in the browser.
 
 ## Screenshot
 
@@ -57,6 +57,13 @@ upload paired FASTQ files and inspect the merged results directly in the browser
    cp ../target/wasm32-unknown-unknown/release/flash_wasm.wasm public/
    ```
 
-2. Start the playground (`pnpm dev`/`npm run dev`) and open the **Upload** tab. Select your
-   forward (`R1`) and reverse (`R2`) FASTQ files, then click **Run FLASH** to view or download
-   the combined and not-combined outputs.
+2. Start the playground (`pnpm dev`/`npm run dev`) and open the **Datasets** and **FLASH Merge**
+   tabs.
+   - In **Datasets**, upload a CSV/JSON file to register a queryable in-memory view without leaving the UI.
+   - In **FLASH Merge**, select your forward (`R1`) and reverse (`R2`) FASTQ
+     files, then click **Run FLASH** to view or download the merged outputs. The uploader also
+     registers four DataFusion views so you can query the results directly:
+
+   - `flash_input_pairs` with the original paired reads.
+   - `flash_combined` with successfully merged reads.
+   - `flash_not_combined_left` / `flash_not_combined_right` mirroring FLASH's not-combined outputs.

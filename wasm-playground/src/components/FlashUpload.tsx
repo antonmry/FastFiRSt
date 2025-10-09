@@ -1,6 +1,9 @@
-import { Alert, Button, FileInput, Group, Loader, Stack, Text, Textarea } from "@mantine/core";
+import { Alert, Button, FileInput, Group, Loader, Stack, Text } from "@mantine/core";
 import { useState } from "react";
+import { useSetAtom } from "jotai";
+import { historyListAtom } from "./History";
 import { runFlash, type FlashResult } from "../lib/flash";
+import { dfCtx } from "../App";
 
 interface DownloadTarget {
   label: string;
@@ -32,6 +35,7 @@ export function FlashUpload() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FlashResult | null>(null);
+  const setHistoryList = useSetAtom(historyListAtom);
 
   const handleRun = async () => {
     if (!forwardFile || !reverseFile) {
@@ -48,12 +52,44 @@ export function FlashUpload() {
         reverseFile.arrayBuffer(),
       ]);
 
+      const forwardText = new TextDecoder().decode(forwardBuffer);
+      const reverseText = new TextDecoder().decode(reverseBuffer);
+
+      const forwardRecords = parseFastq(forwardText);
+      const reverseRecords = parseFastq(reverseText);
+
+      if (forwardRecords.length !== reverseRecords.length) {
+        throw new Error(
+          `FASTQ inputs have different number of records (${forwardRecords.length} vs ${reverseRecords.length})`,
+        );
+      }
+
       const flashResult = await runFlash(new Uint8Array(forwardBuffer), new Uint8Array(reverseBuffer));
       setResult(flashResult);
+
+      await registerFlashTables({
+        forwardRecords,
+        reverseRecords,
+        flashResult,
+      });
+
+      setHistoryList((history) => [
+        {
+          query: "-- FLASH upload --",
+          result:
+            "Registered tables: flash_input_pairs, flash_combined, flash_not_combined_left, flash_not_combined_right",
+          isErr: false,
+        },
+        ...history,
+      ]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
       setResult(null);
+      setHistoryList((history) => [
+        { query: "-- FLASH upload (failed) --", result: message, isErr: true },
+        ...history,
+      ]);
     } finally {
       setIsRunning(false);
     }
@@ -78,7 +114,8 @@ export function FlashUpload() {
     <Stack gap="md">
       <Text size="sm">
         Upload paired FASTQ files to run the FLASH merge algorithm directly in your browser using
-        the Rust/WebAssembly port of flash-lib.
+        the Rust/WebAssembly port of flash-lib. The combined and not-combined outputs can be
+        inspected below or queried via the registered DataFusion views.
       </Text>
 
       <FileInput
@@ -113,7 +150,7 @@ export function FlashUpload() {
       </Group>
 
       {error && (
-        <Alert color="red" icon={<div className="i-tabler-alert-triangle" style={{ width: 16, height: 16 }} />}>
+        <Alert color="red">
           {error}
         </Alert>
       )}
@@ -123,28 +160,183 @@ export function FlashUpload() {
           <Text fw={600}>Outputs</Text>
 
           {downloadTargets.map((target) => (
-            <Stack key={target.label} gap="xs">
-              <Group justify="space-between" align="center">
-                <Text>{target.label}</Text>
-                <Button
-                  variant="light"
-                  leftSection={<div className="i-tabler-download" style={{ width: 16, height: 16 }} />}
-                  onClick={() => handleDownload(target)}
-                >
-                  Download
-                </Button>
-              </Group>
-              <Textarea
-                autosize
-                minRows={4}
-                maxRows={12}
-                value={target.accessor(result)}
-                readOnly
-              />
-            </Stack>
+            <Group key={target.label} justify="space-between" align="center">
+              <Stack gap={0} className="flex-1">
+                <Text fw={500}>{target.label}</Text>
+                <Text size="sm" c="dimmed">
+                  {formatFastqSummary(target.accessor(result))}
+                </Text>
+              </Stack>
+              <Button variant="light" onClick={() => handleDownload(target)}>
+                Download
+              </Button>
+            </Group>
           ))}
         </Stack>
       )}
     </Stack>
   );
+}
+
+type FastqRecord = {
+  tag: string;
+  seq: string;
+  qual: string;
+};
+
+async function registerFlashTables(params: {
+  forwardRecords: FastqRecord[];
+  reverseRecords: FastqRecord[];
+  flashResult: FlashResult;
+}) {
+  const { forwardRecords, reverseRecords, flashResult } = params;
+
+  const combinedRecords = parseFastqSafe(flashResult.combined);
+  const notLeftRecords = parseFastqSafe(flashResult.notCombined1);
+  const notRightRecords = parseFastqSafe(flashResult.notCombined2);
+
+  await createFlashView(
+    "flash_input_pairs",
+    ["idx", "tag1", "seq1", "qual1", "tag2", "seq2", "qual2"],
+    forwardRecords.map((left, idx) => [
+      idx,
+      left.tag,
+      left.seq,
+      left.qual,
+      reverseRecords[idx].tag,
+      reverseRecords[idx].seq,
+      reverseRecords[idx].qual,
+    ]),
+  );
+
+  await createFlashView(
+    "flash_combined",
+    ["tag", "seq", "qual"],
+    combinedRecords.map((row) => [row.tag, row.seq, row.qual]),
+  );
+
+  await createFlashView(
+    "flash_not_combined_left",
+    ["tag", "seq", "qual"],
+    notLeftRecords.map((row) => [row.tag, row.seq, row.qual]),
+  );
+
+  await createFlashView(
+    "flash_not_combined_right",
+    ["tag", "seq", "qual"],
+    notRightRecords.map((row) => [row.tag, row.seq, row.qual]),
+  );
+}
+
+async function createFlashView(
+  tableName: string,
+  columns: string[],
+  rows: Array<Array<string | number | null>>,
+) {
+  await dropRelations(tableName);
+
+  if (rows.length === 0) {
+    const selectList = columns
+      .map((name) => `CAST(NULL AS TEXT) AS ${name}`)
+      .join(", ");
+    await dfCtx.execute_sql(
+      `CREATE VIEW ${tableName} AS SELECT ${selectList} WHERE 1 = 0`,
+    );
+    return;
+  }
+
+  const columnList = columns.join(", ");
+  const valuesSql = rows
+    .map((row) => `(${row.map(sqlLiteral).join(", ")})`)
+    .join(",\n    ");
+
+  await dfCtx.execute_sql(
+    `CREATE VIEW ${tableName} AS SELECT * FROM (VALUES
+    ${valuesSql}
+  ) AS t(${columnList})`,
+  );
+}
+
+async function dropRelations(name: string) {
+  try {
+    await dfCtx.execute_sql(`DROP VIEW IF EXISTS ${name}`);
+  } catch (err) {
+    console.warn(`Failed to drop view ${name}:`, err);
+  }
+  try {
+    await dfCtx.execute_sql(`DROP TABLE IF EXISTS ${name}`);
+  } catch (err) {
+    console.warn(`Failed to drop table ${name}:`, err);
+  }
+}
+
+function sqlLiteral(value: string | number | null): string {
+  if (value === null) {
+    return "NULL";
+  }
+  if (typeof value === "number") {
+    return value.toString();
+  }
+  const escaped = value.replace(/'/g, "''");
+  return `'${escaped}'`;
+}
+
+function parseFastqSafe(text: string): FastqRecord[] {
+  if (!text.trim()) {
+    return [];
+  }
+  return parseFastq(text);
+}
+
+function parseFastq(text: string): FastqRecord[] {
+  const lines = text.split(/\r?\n/);
+  const records: FastqRecord[] = [];
+  let idx = 0;
+
+  const nextNonempty = () => {
+    while (idx < lines.length) {
+      const line = lines[idx++]?.trimEnd();
+      if (line && line.length > 0) {
+        return line;
+      }
+    }
+    return undefined;
+  };
+
+  for (;;) {
+    const tag = nextNonempty();
+    if (!tag) {
+      break;
+    }
+    const seq = nextNonempty();
+    const plus = nextNonempty();
+    const qual = nextNonempty();
+
+    if (!seq || !plus || !qual) {
+      throw new Error("Unexpected EOF while parsing FASTQ record");
+    }
+    if (!tag.startsWith("@")) {
+      throw new Error(`Invalid FASTQ tag line: ${tag}`);
+    }
+    if (!plus.startsWith("+")) {
+      throw new Error(`Invalid FASTQ '+' separator: ${plus}`);
+    }
+    if (seq.length !== qual.length) {
+      throw new Error(
+        `Sequence and quality lengths differ for ${tag}: ${seq.length} vs ${qual.length}`,
+      );
+    }
+
+    records.push({ tag, seq, qual });
+  }
+
+  return records;
+}
+
+function formatFastqSummary(content: string): string {
+  const records = parseFastqSafe(content);
+  if (records.length === 0) {
+    return "0 records";
+  }
+  return records.length === 1 ? "1 record" : `${records.length} records`;
 }

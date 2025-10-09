@@ -8,7 +8,14 @@ export function About() {
           </div>
         </header>
         <div className="explain">
-          <p>Playground of <a href="https://github.com/apache/arrow-datafusion">Apache DataFusion</a>. In the early experimental stage as <a href="https://github.com/waynexia/datafusion-playground">my side project.</a></p>
+          <p>
+            Playground of
+            {" "}
+            <a href="https://github.com/datafusion-contrib/datafusion-wasm-playground">
+              Apache DataFusion
+            </a>
+            .
+          </p>
           <p className='c-gray'>It might take a while to load the wasm file.</p>
         </div>
       </div >

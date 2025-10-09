@@ -1,28 +1,24 @@
 import { Title, Tooltip, UnstyledButton, rem } from "@mantine/core";
 import { atom, useAtom, useAtomValue } from "jotai";
 import { About } from "./About";
-import { CloudConfig } from "./CloudConfig";
 import { FlashUpload } from "./FlashUpload";
 
-// unresolved problem:
-// - icon is not rounded
-
 const mainTabData = [
-  { icon: "i-tabler-info-circle", label: 'About' },
-  { icon: "i-tabler-cloud-share", label: 'Cloud' },
-  { icon: "i-tabler-file-upload", label: 'Upload' },
-  { icon: "i-tabler-settings", label: 'Settings' },
+  { icon: "i-tabler-info-circle", label: "About" },
+  { icon: "i-tabler-flask", label: "FLASH Merge" },
 ];
 
-const activeTabAtom = atom("About")
+const activeTabAtom = atom("About");
 
 function SwitchTab() {
-  const activeTab = useAtomValue(activeTabAtom)
+  const activeTab = useAtomValue(activeTabAtom);
   switch (activeTab) {
-    case "About": return <About />
-    case "Cloud": return <CloudConfig />
-    case "Upload": return <FlashUpload />
-    default: return <div>Empty Tab</div>
+    case "About":
+      return <About />;
+    case "FLASH Merge":
+      return <FlashUpload />;
+    default:
+      return <div>Empty Tab</div>;
   }
 }
 
@@ -39,14 +35,16 @@ export function Sidebar() {
     >
       <UnstyledButton
         onClick={() => setActiveTab(tab.label)}
-        className={"size-7 rounded-5 flex flex-items-center flex-justify-center " + (tab.label === activeTab ? " c-blue-5 bg-blue-1" : " hover:bg-gray-2")}
+        className={
+          "size-7 rounded-5 flex flex-items-center flex-justify-center " +
+          (tab.label === activeTab ? " c-blue-5 bg-blue-1" : " hover:bg-gray-2")
+        }
         data-active={tab.label === activeTab || undefined}
       >
         <div className={tab.icon + " m-1 rounded"} style={{ width: rem(22), height: rem(22) }} />
       </UnstyledButton>
     </Tooltip>
   ));
-
 
   return (
     <nav className="bg-white h-full flex flex-col border-r-solid border-r-gray border-r-1">
@@ -65,9 +63,8 @@ export function Sidebar() {
           <div className="p2">
             {SwitchTab()}
           </div>
-
         </div>
       </div>
     </nav>
-  )
+  );
 }
