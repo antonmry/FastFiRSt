@@ -7,8 +7,10 @@ import jotaiDebugLabel from "jotai/babel/plugin-debug-label";
 import jotaiReactRefresh from "jotai/babel/plugin-react-refresh";
 
 // https://vitejs.dev/config/
+const repoBase = process.env.GITHUB_REPOSITORY?.split("/")[1] ?? "FastFiRSt";
+
 export default defineConfig({
-  base: "/datafusion-wasm-playground/",
+  base: `/${repoBase}/`,
   plugins: [
     wasm(),
     topLevelAwait(),
