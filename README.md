@@ -1,17 +1,62 @@
 # FastFiRSt
 
-Workspace containing the Rust port of the [FLASH "lowercase overhang"
-tool](https://github.com/Jerrythafast/FLASH-lowercase-overhang).
+FastFiRSt ports two DNA sequencing utilities to Rust so they can handle large
+datasets more efficiently. FLASH merges paired-end reads into longer fragments,
+while PERF identifies microsatellites in DNA sequences, both critical steps in
+genome assembly workflows.
 
-- `flash-lib`: core library crate exposing the merge algorithm.
-- `flash-cli`: thin CLI wrapper that matches the original FLASH command-line
+Genomics workloads routinely process billions of bases, so every percentage of
+performance improvement shortens total runtimes, cuts infrastructure costs, and
+reduces the carbon impact of large compute clusters. By consolidating the tools
+into highly optimized Rust binaries and streamlining their data pipelines, the
+project aims to deliver faster science with a lighter environmental footprint.
+
+- FLASH (C): [https://github.com/Jerrythafast/FLASH-lowercase-overhang](https://github.com/Jerrythafast/FLASH-lowercase-overhang). It merges paired-end reads.
+- PERF (Python): [https://github.com/rkmlab/perf](https://github.com/rkmlab/perf). It detects microsatellites.
+
+Rust combines C-like performance with memory safety, fearless concurrency, and
+rich tooling, making it ideal for rewriting high-throughput bioinformatics
+software that previously relied on native extensions or manual memory
+management. The resulting binaries are portable and efficient across CLI, data
+processing backends, and WebAssembly targets.
+
+FastFiRSt also adopts the Apache Arrow ecosystem to keep data in a vectorized,
+columnar format from ingestion to analytics. Arrow's in-memory layout powers
+[DataFusion](https://arrow.apache.org/datafusion/), a Rust-native SQL query
+engine embedded in this workspace, and [Ballista](https://github.com/apache/arrow-ballista),
+its distributed execution layer. Together they enable the project to scale from
+local experiments to cluster-sized runs with minimal code changes, while reusing
+the same kernels for both batch analytics and interactive workflows.
+
+The repository also reimagines the [Hadoop-based BigFiRSt data
+pipeline](https://github.com/JinxiangChenHome/BigFiRSt/tree/master) that
+orchestrates both tools. The resulting improvements of the BigFiRSt data
+pipeline are documented in [BigFiRSt: A Software Program Using Big Data
+Technique for Mining Simple Sequence Repeats From Large-Scale Sequencing
+Data](https://pmc.ncbi.nlm.nih.gov/articles/PMC8805145/pdf/fdata-04-727216.pdf).
+
+Project goals include:
+
+- Porting both tools to [Rust](https://rust-lang.org/) for improved performance
+  (see the [related paper](https://arxiv.org/html/2410.05460v1#S3.T3) for
+  details).
+- Applying [Apache Arrow
+  Ballista](https://andrew.nerdnetworks.org/pdf/SIGMOD-2024-lamb.pdf)
+  optimizations to the end-to-end pipeline.
+- Exposing the tools through WebAssembly so they remain easy to use without
+  dedicated infrastructure.
+
+## Workspace structure
+
+- `flash-lib`: Core library crate exposing the merge algorithm.
+- `flash-cli`: Thin CLI wrapper that matches the original FLASH command-line
   flags and writes the three FASTQ outputs.
-- `flash-df`: scaffolding for running the merge pipeline through
+- `flash-df`: Provides scaffolding for running the merge pipeline through
   DataFusion/Ballista (feature-gated stubs for now).
-- `flash-wasm`: minimal WebAssembly interface exposing the FLASH merge logic for
+- `flash-wasm`: Minimal WebAssembly interface exposing the FLASH merge logic for
   the playground UI.
 - `wasm-playground`: Vite/Mantine web playground that can execute SQL queries
-  against DataFusion and now run FLASH locally in the browser.
+  against DataFusion and run FLASH locally in the browser.
 
 ## Installing the CLI
 
@@ -46,8 +91,9 @@ directory. Optional parameters default to the FLASH values; run
 
 ## Library usage
 
-It's also published in [crates.io](https://crates.io/crates/flash-cli). You
-can add it to your project with:
+The `flash-lib` crate is also published on
+[crates.io](https://crates.io/crates/flash-lib). You can add it to your project
+with:
 
 ```bash
 cargo add flash-lib
@@ -64,10 +110,10 @@ merge_fastq_files("input1.fq", "input2.fq", "./out", "out", &params)?;
 
 ## DataFusion/Ballista prototype
 
-The `flash-df` crate currently exposes a `FlashDistributedJob` wrapper that can
-execute the merge locally (re-using `flash-lib`) and provides feature-gated
-hooks for wiring the workflow into a `datafusion::SessionContext`. Enable the
-relevant feature flag when building:
+The `flash-df` crate exposes a `FlashDistributedJob` wrapper that executes the
+merge locally (re-using `flash-lib`) and provides feature-gated hooks for wiring
+the workflow into a `datafusion::SessionContext`. Enable the relevant feature
+flag when building:
 
 ```bash
 cargo build -p flash-df --features datafusion
@@ -89,7 +135,7 @@ let plan = job.build_logical_plan(&ctx).await?; // logical plan with combined/no
 job.execute_datafusion().await?;
 ```
 
-For a quick preview, you can run the bundled example against the sample FASTQ
+For a quick preview, you can run the bundled examples against the sample FASTQ
 files checked into the workspace root:
 
 ```bash
@@ -112,7 +158,7 @@ This playground bundles the Rust implementation of FLASH compiled to
 WebAssembly, so you can upload paired FASTQ files and inspect the merged results
 directly in the browser:
 
-1. Build the WebAssembly artefact from the workspace root:
+1. Build the WebAssembly artifact from the workspace root:
 
    ```bash
    rustup target add wasm32-unknown-unknown # once per environment
@@ -125,8 +171,7 @@ directly in the browser:
    tab.
    - In **FLASH Merge**, select your forward (`R1`) and reverse (`R2`) FASTQ
      files, then click **Run FLASH** to view or download the merged outputs. The
-     uploader also registers four DataFusion views so you can query the results
-     directly:
+     uploader also registers four DataFusion views for direct querying:
 
    - `flash_input_pairs` with the original paired reads.
    - `flash_combined` with successfully merged reads.
