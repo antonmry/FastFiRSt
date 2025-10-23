@@ -180,6 +180,13 @@ cargo run -p flash-df --example flash_udf --features datafusion -- \
   input1.fq \
   input2.fq \
   5
+
+# mirror the CLI behaviour via DataFusion streaming execution
+cargo run -p flash-df --example flash_cli --features datafusion -- \
+  input1.fq \
+  input2.fq \
+  ./out-df \
+  flash
 ```
 
 ## Website using WASM (Experimental)
