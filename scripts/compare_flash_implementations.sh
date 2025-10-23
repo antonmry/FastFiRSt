@@ -8,7 +8,7 @@ ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INPUT_DIR="${INPUT_DIR:-${ROOT_DIR}/benchmarks/inputs}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/benchmarks/outputs}"
 READ_LENGTH="${READ_LENGTH:-150}"
-DEFAULT_COUNTS=(100 10000 1000000 100000000)
+DEFAULT_COUNTS=(100 10000 1000000)
 if [[ -n "${FLASH_BENCH_COUNTS:-}" ]]; then
   read -r -a COUNTS <<<"${FLASH_BENCH_COUNTS}"
 else
