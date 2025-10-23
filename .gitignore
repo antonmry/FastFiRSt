@@ -27,8 +27,7 @@ notebooks/.ipynb_checkpoints/
 *.tmp
 
 # IA
-Agents.md
-AGENT.md
+AGENTS.md
 
 # Tests
 *.fq

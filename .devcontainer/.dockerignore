@@ -1,0 +1,8 @@
+.git
+.gitmodules
+out
+wasm-playground/node_modules
+wasm-playground/dist
+**/target
+**/.DS_Store
+**/*.fq
