@@ -38,3 +38,6 @@ AGENTS.md
 *.fastq
 out/
 /wasm-playground/.vite/
+
+# Benchmark artifacts
+/benchmarks/
