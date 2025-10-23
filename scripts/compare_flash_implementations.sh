@@ -20,6 +20,9 @@ ORDER_WARNINGS=()
 FASTQ_GEN_BIN="${FASTQ_GEN_BIN:-${ROOT_DIR}/target/release/fastq-gen-cli}"
 FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
 FLASH_C_BIN="${FLASH_C_BIN:-${ROOT_DIR}/bin/flash-lowercase-overhang}"
+FLASH_DF_BIN="${FLASH_DF_BIN:-${ROOT_DIR}/target/release/examples/flash_cli}"
+
+PROGRAMS=("flash-cli" "flash-lowercase-overhang" "flash-df")
 
 ensure_binaries() {
   local need_build=0
@@ -36,6 +39,11 @@ ensure_binaries() {
   if [[ ! -x "$FLASH_C_BIN" ]]; then
     echo "Building FLASH lowercase overhang binary..."
     "${ROOT_DIR}/scripts/build_flash_lowercase_overhang.sh"
+  fi
+
+  if [[ ! -x "$FLASH_DF_BIN" ]]; then
+    echo "Building flash-df example binary..."
+    cargo build --release -p flash-df --example flash_cli --features datafusion
   fi
 }
 
@@ -110,11 +118,37 @@ run_flash_c() {
   elapsed_seconds "$start" "$end"
 }
 
-validate_outputs() {
+run_flash_df() {
+  local count=$1
+  local r1=$2
+  local r2=$3
+  local output_dir="${OUTPUT_DIR}/flash-df/${count}"
+
+  rm -rf "$output_dir"
+  mkdir -p "$output_dir"
+
+  local start
+  start=$(now_ns)
+  "$FLASH_DF_BIN" \
+    "$r1" \
+    "$r2" \
+    "$output_dir" \
+    flash \
+    >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
+  local end
+  end=$(now_ns)
+
+  elapsed_seconds "$start" "$end"
+}
+
+validate_against_baseline() {
   local count=$1
   local r1_path=$2
-  local cli_dir="${OUTPUT_DIR}/flash-cli/${count}"
-  local c_dir="${OUTPUT_DIR}/flash-lowercase-overhang/${count}"
+  local baseline_dir=$3
+  local baseline_label=$4
+  local candidate_dir=$5
+  local candidate_label=$6
+
   local files=(
     "flash.extendedFrags.fastq"
     "flash.notCombined_1.fastq"
@@ -122,24 +156,31 @@ validate_outputs() {
   )
 
   for filename in "${files[@]}"; do
-    local cli_file="${cli_dir}/${filename}"
-    local c_file="${c_dir}/${filename}"
+    local baseline_file="${baseline_dir}/${filename}"
+    local candidate_file="${candidate_dir}/${filename}"
 
-    if [[ ! -f "$cli_file" || ! -f "$c_file" ]]; then
+    if [[ ! -f "$baseline_file" || ! -f "$candidate_file" ]]; then
       echo "Missing output file ${filename} for record count ${count}" >&2
       exit 1
     fi
 
-    if cmp -s "$cli_file" "$c_file"; then
+    if cmp -s "$baseline_file" "$candidate_file"; then
       continue
     fi
 
-    if compare_fastq_sets "$cli_file" "$c_file" "${count}_${filename}"; then
-      detect_order_mismatch "$count" "$r1_path" "$cli_file" "$c_file" "$filename"
+    if compare_fastq_sets "$baseline_file" "$candidate_file" "${count}_${filename}"; then
+      detect_order_mismatch \
+        "$count" \
+        "$r1_path" \
+        "$baseline_file" \
+        "$baseline_label" \
+        "$candidate_file" \
+        "$candidate_label" \
+        "$filename"
       continue
     fi
 
-    echo "Content mismatch detected in ${filename} for record count ${count}" >&2
+    echo "Content mismatch detected in ${filename} between ${baseline_label} and ${candidate_label} for record count ${count}" >&2
     exit 1
   done
 }
@@ -209,40 +250,46 @@ PY
 detect_order_mismatch() {
   local count=$1
   local r1_path=$2
-  local cli_file=$3
-  local c_file=$4
-  local filename=$5
+  local baseline_file=$3
+  local baseline_label=$4
+  local candidate_file=$5
+  local candidate_label=$6
+  local filename=$7
 
-  local info_cli info_c
-  info_cli=$(mktemp "${OUTPUT_DIR}/order_cli_${count}_XXXXXX")
-  info_c=$(mktemp "${OUTPUT_DIR}/order_c_${count}_XXXXXX")
+  local info_baseline info_candidate
+  info_baseline=$(mktemp "${OUTPUT_DIR}/order_${baseline_label}_${count}_XXXXXX")
+  info_candidate=$(mktemp "${OUTPUT_DIR}/order_${candidate_label}_${count}_XXXXXX")
 
-  local cli_ok=0
-  local c_ok=0
+  local baseline_ok=0
+  local candidate_ok=0
 
-  if check_order_against_input "$r1_path" "$cli_file" "$info_cli"; then
-    cli_ok=1
+  if check_order_against_input "$r1_path" "$baseline_file" "$info_baseline"; then
+    baseline_ok=1
   else
-    cli_ok=0
-    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, flash-cli): $(<"$info_cli")")
+    baseline_ok=0
+    local baseline_msg
+    baseline_msg=$(<"$info_baseline")
+    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, ${baseline_label}): ${baseline_msg}")
   fi
 
-  if check_order_against_input "$r1_path" "$c_file" "$info_c"; then
-    c_ok=1
+  if check_order_against_input "$r1_path" "$candidate_file" "$info_candidate"; then
+    candidate_ok=1
   else
-    c_ok=0
-    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, flash-lowercase-overhang): $(<"$info_c")")
+    candidate_ok=0
+    local candidate_msg
+    candidate_msg=$(<"$info_candidate")
+    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, ${candidate_label}): ${candidate_msg}")
   fi
 
-  if [[ "$cli_ok" -eq 1 && "$c_ok" -eq 0 ]]; then
-    echo "Warning: flash-lowercase-overhang output ordering diverged for ${count} (${filename})." >&2
-  elif [[ "$cli_ok" -eq 0 && "$c_ok" -eq 1 ]]; then
-    echo "Warning: flash-cli output ordering diverged for ${count} (${filename})." >&2
+  if [[ "$baseline_ok" -eq 1 && "$candidate_ok" -eq 0 ]]; then
+    echo "Warning: ${candidate_label} output ordering diverged for ${count} (${filename})." >&2
+  elif [[ "$baseline_ok" -eq 0 && "$candidate_ok" -eq 1 ]]; then
+    echo "Warning: ${baseline_label} output ordering diverged for ${count} (${filename})." >&2
   else
-    echo "Warning: Both implementations diverged in ordering for ${count} (${filename})." >&2
+    echo "Warning: Both ${baseline_label} and ${candidate_label} diverged in ordering for ${count} (${filename})." >&2
   fi
 
-  rm -f "$info_cli" "$info_c"
+  rm -f "$info_baseline" "$info_candidate"
 }
 
 check_order_against_input() {
@@ -316,7 +363,7 @@ PY
 
 main() {
   ensure_binaries
-  mkdir -p "$OUTPUT_DIR/flash-cli" "$OUTPUT_DIR/flash-lowercase-overhang"
+  mkdir -p "$OUTPUT_DIR/flash-cli" "$OUTPUT_DIR/flash-lowercase-overhang" "$OUTPUT_DIR/flash-df"
 
   declare -A results
   declare -A input_sizes
@@ -349,8 +396,19 @@ PY
     c_time=$(run_flash_c "$count" "$r1" "$r2")
     results["${count},flash-lowercase-overhang"]=$c_time
 
+    echo "Running flash-df example for ${count} records..."
+    local df_time
+    df_time=$(run_flash_df "$count" "$r1" "$r2")
+    results["${count},flash-df"]=$df_time
+
     echo "Validating outputs for ${count} records..."
-    validate_outputs "$count" "$r1"
+    local baseline_dir="${OUTPUT_DIR}/flash-cli/${count}"
+    validate_against_baseline \
+      "$count" "$r1" "$baseline_dir" "flash-cli" \
+      "${OUTPUT_DIR}/flash-lowercase-overhang/${count}" "flash-lowercase-overhang"
+    validate_against_baseline \
+      "$count" "$r1" "$baseline_dir" "flash-cli" \
+      "${OUTPUT_DIR}/flash-df/${count}" "flash-df"
   done
 
   echo
@@ -358,7 +416,7 @@ PY
   printf "%-12s %-12s %-28s %10s\n" "Records" "Input(MB)" "Program" "Time(s)"
   printf "%-12s %-12s %-28s %10s\n" "-------" "----------" "-------" "-------"
   for count in "${COUNTS[@]}"; do
-    for program in "flash-cli" "flash-lowercase-overhang"; do
+    for program in "${PROGRAMS[@]}"; do
       key="${count},${program}"
       if [[ -n "${results[$key]:-}" ]]; then
         printf "%-12s %-12s %-28s %10s\n" \
