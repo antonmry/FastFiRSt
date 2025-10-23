@@ -181,18 +181,13 @@ cargo run -p flash-df --example flash_udf --features datafusion -- \
   input2.fq \
   5
 
-# mirror the CLI behaviour via DataFusion streaming execution
+# mirror the CLI behaviour via DataFusion execution
 cargo run -p flash-df --example flash_cli --features datafusion -- \
   input1.fq \
   input2.fq \
   ./out-df \
-  flash \
-  --batch-size 4096 \
-  --workers 8
+  flash
 ```
-
-Omit `--batch-size` / `--workers` to rely on the streaming defaults (2 048 pairs per
-chunk and one worker per logical CPU). Setting `--workers 0` also triggers auto-detect.
 
 ## Website using WASM (Experimental)
 

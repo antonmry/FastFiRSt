@@ -22,24 +22,17 @@ FastqPairReader --> FastqScanExec (1 partition)
 
 ### Key Changes
 
-1. **Streaming TableProvider**
-   - `FastqScanExec` implements a custom `ExecutionPlan` that feeds DataFusion
-     via a single partition but internally uses a worker pool.
-   - Chunks (default 2048 pairs) are read sequentially, tagged with a chunk id,
-     and dispatched to workers.
+1. **Sequential TableProvider**
+   - `FastqTableProvider` reads the input FASTQ files sequentially and returns a
+     single in-memory `RecordBatch` via `MemoryExec`.
+   - This mirrors the original behaviour before the experimental worker-pool
+     optimisations and keeps memory usage predictable for the benchmark scale.
 
-2. **Worker Pool with Ordered Merge**
-   - Each worker receives a `ChunkTask` with FASTQ records and builds an Arrow
-     `RecordBatch` after running the UDF logic.
-   - Results flow back through a `crossbeam-channel`; a priority queue keyed by
-     chunk id ensures we emit batches strictly in order.
-   - `FastqScanStream::poll_next` keeps at most `2 * worker_threads` inflight
-     chunks (configurable via `FlashJobConfig::with_worker_threads`, defaulting
-     to the logical CPU count).
-
-3. **Streaming Writer**
-   - `write_plan_stream` now consumes DataFusion’s stream directly and writes
-     FASTQ records as soon as batches are ready—no `collect()` buffering.
+2. **Materialisation**
+   - `FlashDistributedJob::materialize_plans` collects the DataFusion batches and
+     writes the FASTQ outputs in a single thread.
+   - Ordering remains identical to the CLI because records are processed in the
+     same order they are read.
 
 4. **Benchmark Integration**
    - `scripts/compare_flash_implementations.sh` now benchmarks three binaries:
@@ -61,7 +54,7 @@ FastqPairReader --> FastqScanExec (1 partition)
 ## Roadmap
 
 1. **Expose configuration**
-   - Allow CLI/clients to tune chunk size and worker count. ✅
+   - Allow CLI/clients to tune chunk size and worker count. ❌ (rolled back)
    - Surface queue depth metrics for observability.
 
 2. **Ballista Integration**

@@ -8,7 +8,7 @@ usage() {
   cat <<USAGE
 Usage: $(basename "$0") <forward.fq> <reverse.fq> [output_dir] [output_prefix]
 
-Runs the flash-df example with chunk size 4096 and 4 worker threads.
+Runs the flash-df example in sequential mode.
 Defaults: output_dir=./out, output_prefix=flash
 USAGE
 }
@@ -44,8 +44,6 @@ cargo run --quiet -p flash-df --example flash_cli --features datafusion -- \
   "$FORWARD" \
   "$REVERSE" \
   "$OUTPUT_DIR" \
-  "$OUTPUT_PREFIX" \
-  --batch-size 4096 \
-  --workers 4
+  "$OUTPUT_PREFIX"
 
 echo "flash-df outputs written to '$OUTPUT_DIR' with prefix '$OUTPUT_PREFIX'."

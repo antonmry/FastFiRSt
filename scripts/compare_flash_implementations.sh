@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Generate synthetic FASTQ pairs at multiple scales, run both FLASH implementations,
-# compare their outputs, and report execution times.
+# Generate FASTQ pairs at several scales, run the three FLASH implementations,
+# validate the outputs, and report execution times.
 
 set -euo pipefail
 
@@ -8,65 +8,26 @@ ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INPUT_DIR="${INPUT_DIR:-${ROOT_DIR}/benchmarks/inputs}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/benchmarks/outputs}"
 READ_LENGTH="${READ_LENGTH:-150}"
-DEFAULT_COUNTS=(100 1000 10000 100000 1000000)
+
+COUNTS=(100 1000 10000 100000 1000000)
 if [[ -n "${FLASH_BENCH_COUNTS:-}" ]]; then
   read -r -a COUNTS <<<"${FLASH_BENCH_COUNTS}"
-else
-  COUNTS=("${DEFAULT_COUNTS[@]}")
 fi
-
-ORDER_WARNINGS=()
 
 FASTQ_GEN_BIN="${FASTQ_GEN_BIN:-${ROOT_DIR}/target/release/fastq-gen-cli}"
 FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
 FLASH_C_BIN="${FLASH_C_BIN:-${ROOT_DIR}/bin/flash-lowercase-overhang}"
 FLASH_DF_BIN="${FLASH_DF_BIN:-${ROOT_DIR}/target/release/examples/flash_cli}"
 
-if [[ -z ${FLASH_DF_BATCH_SIZE+x} ]]; then
-  FLASH_DF_BATCH_SIZE=4096
-  FLASH_DF_BATCH_SIZE_SRC="default"
-else
-  FLASH_DF_BATCH_SIZE_SRC="env"
-fi
-
-if ! [[ "$FLASH_DF_BATCH_SIZE" =~ ^[0-9]+$ && "$FLASH_DF_BATCH_SIZE" -gt 0 ]]; then
-  echo "FLASH_DF_BATCH_SIZE must be a positive integer (received '$FLASH_DF_BATCH_SIZE')." >&2
-  exit 1
-fi
-
-if [[ -z ${FLASH_DF_WORKERS+x} ]]; then
-  FLASH_DF_WORKERS=$(nproc 2>/dev/null || printf '0')
-  FLASH_DF_WORKERS_SRC="default"
-else
-  FLASH_DF_WORKERS_SRC="env"
-fi
-
-if ! [[ "$FLASH_DF_WORKERS" =~ ^[0-9]+$ ]]; then
-  echo "FLASH_DF_WORKERS must be a non-negative integer (received '$FLASH_DF_WORKERS')." >&2
-  exit 1
-fi
-
-FLASH_DF_WORKERS_DISPLAY="$FLASH_DF_WORKERS"
-FLASH_DF_WORKERS_NOTE="explicit"
-if [[ "$FLASH_DF_WORKERS" =~ ^[0-9]+$ ]]; then
-  if [[ "$FLASH_DF_WORKERS" -eq 0 ]]; then
-    FLASH_DF_WORKERS_NOTE="auto"
-    FLASH_DF_WORKERS_DISPLAY=$(nproc 2>/dev/null || printf 'auto')
-  fi
-else
-  FLASH_DF_WORKERS_NOTE="custom"
-fi
-
 PROGRAMS=("flash-cli" "flash-lowercase-overhang" "flash-df")
 
 ensure_binaries() {
-  local need_build=0
-
+  local need_rust=0
   if [[ ! -x "$FASTQ_GEN_BIN" || ! -x "$FLASH_CLI_BIN" ]]; then
-    need_build=1
+    need_rust=1
   fi
 
-  if [[ "$need_build" -eq 1 ]]; then
+  if [[ "$need_rust" -eq 1 ]]; then
     echo "Building Rust binaries (fastq-gen-cli, flash-cli)..."
     cargo build --release -p fastq-gen-cli -p flash-cli
   fi
@@ -120,15 +81,12 @@ run_flash_cli() {
   rm -rf "$output_dir"
   mkdir -p "$output_dir"
 
-  local start
-  start=$(now_ns)
+  local start=$(now_ns)
   "$FLASH_CLI_BIN" "$r1" "$r2" \
     --output-dir "$output_dir" \
     --output-prefix flash \
     >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
-  local end
-  end=$(now_ns)
-
+  local end=$(now_ns)
   elapsed_seconds "$start" "$end"
 }
 
@@ -141,15 +99,12 @@ run_flash_c() {
   rm -rf "$output_dir"
   mkdir -p "$output_dir"
 
-  local start
-  start=$(now_ns)
+  local start=$(now_ns)
   "$FLASH_C_BIN" "$r1" "$r2" \
     -d "$output_dir" \
     -o flash \
     >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
-  local end
-  end=$(now_ns)
-
+  local end=$(now_ns)
   elapsed_seconds "$start" "$end"
 }
 
@@ -162,19 +117,14 @@ run_flash_df() {
   rm -rf "$output_dir"
   mkdir -p "$output_dir"
 
-  local start
-  start=$(now_ns)
+  local start=$(now_ns)
   "$FLASH_DF_BIN" \
     "$r1" \
     "$r2" \
     "$output_dir" \
     flash \
-    --batch-size "$FLASH_DF_BATCH_SIZE" \
-    --workers "$FLASH_DF_WORKERS" \
     >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
-  local end
-  end=$(now_ns)
-
+  local end=$(now_ns)
   elapsed_seconds "$start" "$end"
 }
 
@@ -228,8 +178,8 @@ compare_fastq_sets() {
   local label=$3
 
   local tmp_a tmp_b
-  tmp_a=$(mktemp "${OUTPUT_DIR}/hash_${label}_cliXXXXXX")
-  tmp_b=$(mktemp "${OUTPUT_DIR}/hash_${label}_flashXXXXXX")
+  tmp_a=$(mktemp "${OUTPUT_DIR}/hash_${label}_aXXXXXX")
+  tmp_b=$(mktemp "${OUTPUT_DIR}/hash_${label}_bXXXXXX")
 
   hash_fastq_records "$file_a" "$tmp_a"
   hash_fastq_records "$file_b" "$tmp_b"
@@ -270,19 +220,17 @@ def read_record(handle):
     return tag.rstrip(), seq.rstrip(), qual.rstrip()
 
 with open(input_path, "r", encoding="utf-8") as src, open(output_path, "w", encoding="utf-8") as dst:
-    record_count = 0
     while True:
         record = read_record(src)
         if record is None:
             break
         tag, seq, qual = record
-        if not tag.startswith("@"):
-            raise SystemExit(f"Invalid FASTQ tag line: {tag}")
         digest = hashlib.sha256((seq + "\n" + qual).encode("utf-8")).hexdigest()
         dst.write(f"{tag}\t{digest}\n")
-        record_count += 1
 PY
 }
+
+ORDER_WARNINGS=()
 
 detect_order_mismatch() {
   local count=$1
@@ -303,19 +251,13 @@ detect_order_mismatch() {
   if check_order_against_input "$r1_path" "$baseline_file" "$info_baseline"; then
     baseline_ok=1
   else
-    baseline_ok=0
-    local baseline_msg
-    baseline_msg=$(<"$info_baseline")
-    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, ${baseline_label}): ${baseline_msg}")
+    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, ${baseline_label}): $(<"$info_baseline")")
   fi
 
   if check_order_against_input "$r1_path" "$candidate_file" "$info_candidate"; then
     candidate_ok=1
   else
-    candidate_ok=0
-    local candidate_msg
-    candidate_msg=$(<"$info_candidate")
-    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, ${candidate_label}): ${candidate_msg}")
+    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, ${candidate_label}): $(<"$info_candidate")")
   fi
 
   if [[ "$baseline_ok" -eq 1 && "$candidate_ok" -eq 0 ]]; then
@@ -355,8 +297,7 @@ def load_input_indices(path: Path):
             qual = handle.readline()
             if not seq or not plus or not qual:
                 raise SystemExit(f"Incomplete FASTQ record in {path}")
-            tag = tag.rstrip()
-            mapping[tag] = idx
+            mapping[tag.rstrip()] = idx
             idx += 1
     return mapping
 
@@ -364,8 +305,7 @@ def write_info(message: str):
     with info_path.open("w", encoding="utf-8") as info_handle:
         info_handle.write(message)
 
-tag_index = load_input_indices(input_r1_path)
-
+indices = load_input_indices(input_r1_path)
 previous_idx = -1
 previous_tag = None
 record_number = 0
@@ -382,10 +322,10 @@ with output_path.open("r", encoding="utf-8") as out_handle:
             raise SystemExit(f"Incomplete FASTQ record in output {output_path}")
         tag = tag.rstrip()
         record_number += 1
-        if tag not in tag_index:
+        if tag not in indices:
             write_info(f"tag {tag} missing from inputs")
             sys.exit(1)
-        idx = tag_index[tag]
+        idx = indices[tag]
         if idx <= previous_idx:
             write_info(
                 f"out-of-order tag {tag} (input index {idx}) appears after {previous_tag} (index {previous_idx}) at output record {record_number}"
@@ -405,7 +345,7 @@ main() {
   declare -A results
   declare -A input_sizes
 
-  echo "flash-df config: batch_size=${FLASH_DF_BATCH_SIZE} (${FLASH_DF_BATCH_SIZE_SRC}) workers=${FLASH_DF_WORKERS_DISPLAY} (${FLASH_DF_WORKERS_NOTE})"
+  echo "flash-df config: sequential mode"
 
   for count in "${COUNTS[@]}"; do
     generate_inputs "$count"
@@ -413,13 +353,11 @@ main() {
     local r2="$INPUT_DIR/${count}_R2.fastq"
 
     local size_mb
-    size_mb=$(
-      python3 - "$r1" "$r2" <<'PY'
+    size_mb=$(python3 - "$r1" "$r2" <<'PY'
 import os
 import sys
-
-r1_path, r2_path = sys.argv[1], sys.argv[2]
-total = os.path.getsize(r1_path) + os.path.getsize(r2_path)
+r1, r2 = sys.argv[1], sys.argv[2]
+total = os.path.getsize(r1) + os.path.getsize(r2)
 print(f"{total / (1024 * 1024):.2f}")
 PY
     )

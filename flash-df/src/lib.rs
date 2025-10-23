@@ -2,22 +2,17 @@
 //!
 //! The goal of this crate is to expose helpers that register the FASTQ inputs
 //! handled by `flash-lib` as DataFusion data sources and build the logical plan
-//! necessary to reproduce FLASH's merging behaviour.  It also sketches the
-//! entry points needed to submit the job to a Ballista cluster.  The heavy
-//! lifting is still carried out by `flash-lib`; this crate focuses on the
-//! distributed execution wiring.
+//! necessary to reproduce FLASH's merging behaviour. The heavy lifting is still
+//! carried out by `flash-lib`; this crate focuses on the integration wiring.
 
 use anyhow::Result;
-#[cfg(feature = "datafusion")]
-use flash_lib::FastqRecord;
-#[cfg(feature = "datafusion")]
-use flash_lib::combine_pair_from_strs;
 use flash_lib::{CombineParams, merge_fastq_files};
 
 #[cfg(feature = "datafusion")]
-use anyhow::anyhow;
+use flash_lib::combine_pair_from_strs;
+
 #[cfg(feature = "datafusion")]
-use std::collections::BTreeMap;
+use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "datafusion")]
 use std::{any::Any, sync::Arc};
@@ -25,12 +20,9 @@ use std::{any::Any, sync::Arc};
 #[cfg(feature = "datafusion")]
 use async_trait::async_trait;
 #[cfg(feature = "datafusion")]
-use crossbeam_channel::{Receiver, Sender, bounded};
-#[cfg(feature = "datafusion")]
 use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, StringArray, StringBuilder};
 #[cfg(feature = "datafusion")]
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-#[cfg(feature = "datafusion")]
 #[cfg(feature = "datafusion")]
 use datafusion::arrow::record_batch::RecordBatch;
 #[cfg(feature = "datafusion")]
@@ -44,44 +36,21 @@ use datafusion::datasource::{TableProvider, TableType};
 #[cfg(feature = "datafusion")]
 use datafusion::error::{DataFusionError, Result as DFResult};
 #[cfg(feature = "datafusion")]
-use datafusion::execution::context::{SessionContext, TaskContext};
-#[cfg(feature = "datafusion")]
-use datafusion::logical_expr::ColumnarValue;
+use datafusion::execution::context::SessionContext;
 #[cfg(feature = "datafusion")]
 use datafusion::logical_expr::{
-    Expr, LogicalPlan, ScalarUDF, ScalarUDFImpl, Signature, Volatility, col,
+    ColumnarValue, Expr, LogicalPlan, ScalarUDF, ScalarUDFImpl, Signature, Volatility, col,
 };
 #[cfg(feature = "datafusion")]
-use datafusion::physical_expr::EquivalenceProperties;
-#[cfg(feature = "datafusion")]
-use datafusion::physical_plan::execution_plan::{DisplayAs, DisplayFormatType};
-#[cfg(feature = "datafusion")]
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-#[cfg(feature = "datafusion")]
-use datafusion::physical_plan::{
-    ExecutionMode, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
-    Statistics,
-};
+use datafusion::physical_plan::{ExecutionPlan, memory::MemoryExec};
 #[cfg(feature = "datafusion")]
 use datafusion::prelude::SessionConfig;
 #[cfg(feature = "datafusion")]
 use flash_lib::FastqPairReader;
 #[cfg(feature = "datafusion")]
-use futures::{Stream, StreamExt};
-#[cfg(feature = "datafusion")]
-use num_cpus;
-#[cfg(feature = "datafusion")]
-use std::fmt;
-#[cfg(feature = "datafusion")]
 use std::fs::{self, File};
 #[cfg(feature = "datafusion")]
 use std::io::{BufWriter, Write};
-#[cfg(feature = "datafusion")]
-use std::pin::Pin;
-#[cfg(feature = "datafusion")]
-use std::task::{Context, Poll};
-#[cfg(feature = "datafusion")]
-use std::thread;
 
 #[cfg(feature = "datafusion")]
 const FLASH_COMBINED_TAG_UDF: &str = "flash_combined_tag";
@@ -99,13 +68,8 @@ const COMBINED_TAG_COL: &str = "combined_tag";
 const COMBINED_SEQ_COL: &str = "combined_seq";
 #[cfg(feature = "datafusion")]
 const COMBINED_QUAL_COL: &str = "combined_qual";
-#[cfg(feature = "datafusion")]
-const DEFAULT_BATCH_SIZE: usize = 2048;
-#[cfg(feature = "datafusion")]
-const DEFAULT_WORKER_THREADS: usize = 0; // 0 => auto detect
 
-/// Configuration for a FLASH job, regardless of which execution backend is
-/// used.
+/// Configuration for a FLASH job, regardless of which execution backend is used.
 #[derive(Debug, Clone)]
 pub struct FlashJobConfig {
     /// Forward FASTQ file.
@@ -116,10 +80,6 @@ pub struct FlashJobConfig {
     pub output_dir: PathBuf,
     /// Output prefix (defaults to `out` in the CLI).
     pub output_prefix: String,
-    /// Optional batch size hint for streaming scans (pairs per chunk).
-    pub batch_size: Option<usize>,
-    /// Optional worker hint for thread pool (defaults to logical CPUs).
-    pub worker_threads: Option<usize>,
 }
 
 impl FlashJobConfig {
@@ -135,21 +95,7 @@ impl FlashJobConfig {
             reverse: reverse.as_ref().to_path_buf(),
             output_dir: output_dir.as_ref().to_path_buf(),
             output_prefix: output_prefix.into(),
-            batch_size: None,
-            worker_threads: None,
         }
-    }
-
-    /// Override the batch size used when streaming FASTQ rows.
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = Some(batch_size);
-        self
-    }
-
-    /// Override the worker thread count used by the streaming scan (set `0` for auto-detect).
-    pub fn with_worker_threads(mut self, workers: usize) -> Self {
-        self.worker_threads = Some(workers);
-        self
     }
 }
 
@@ -177,8 +123,8 @@ impl FlashDistributedJob {
     }
 
     /// Execute the job locally using the reference implementation in
-    /// `flash-lib`.  This is handy for testing the distributed pipeline logic.
-    pub fn execute_local(&self) -> Result<()> {
+    /// `flash-lib`. Handy for testing the distributed pipeline logic.
+    pub fn execute_reference(&self) -> Result<()> {
         merge_fastq_files(
             &self.config.forward,
             &self.config.reverse,
@@ -191,7 +137,7 @@ impl FlashDistributedJob {
 
 #[cfg(feature = "datafusion")]
 const FASTQ_TABLE_NAME: &str = "flash_pairs";
-#[cfg(feature = "datafusion")]
+
 #[cfg(feature = "datafusion")]
 fn to_df_error(err: anyhow::Error) -> DataFusionError {
     DataFusionError::Execution(err.to_string())
@@ -203,19 +149,11 @@ pub struct FastqTableProvider {
     reverse: PathBuf,
     phred_offset: u8,
     schema: SchemaRef,
-    batch_size: usize,
-    worker_threads: usize,
 }
 
 #[cfg(feature = "datafusion")]
 impl FastqTableProvider {
-    pub fn new(
-        forward: PathBuf,
-        reverse: PathBuf,
-        phred_offset: u8,
-        batch_size: usize,
-        worker_threads: usize,
-    ) -> Self {
+    pub fn new(forward: PathBuf, reverse: PathBuf, phred_offset: u8) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tag1", DataType::Utf8, false),
             Field::new("seq1", DataType::Utf8, false),
@@ -229,13 +167,54 @@ impl FastqTableProvider {
             reverse,
             phred_offset,
             schema,
-            batch_size,
-            worker_threads,
         }
     }
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    fn read_all_records(&self, limit: Option<usize>) -> Result<RecordBatch> {
+        let mut pair_reader =
+            FastqPairReader::from_paths(&self.forward, &self.reverse, self.phred_offset)?;
+
+        let mut tag1 = StringBuilder::new();
+        let mut seq1 = StringBuilder::new();
+        let mut qual1 = StringBuilder::new();
+        let mut tag2 = StringBuilder::new();
+        let mut seq2 = StringBuilder::new();
+        let mut qual2 = StringBuilder::new();
+
+        let mut rows = 0usize;
+        while let Some((r1, r2)) = pair_reader.next_pair()? {
+            if let Some(max) = limit {
+                if rows >= max {
+                    break;
+                }
+            }
+
+            tag1.append_value(r1.tag());
+            seq1.append_value(&r1.seq_string());
+            qual1.append_value(&r1.qual_string(self.phred_offset));
+
+            tag2.append_value(r2.tag());
+            seq2.append_value(&r2.seq_string());
+            qual2.append_value(&r2.qual_string(self.phred_offset));
+
+            rows += 1;
+        }
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(tag1.finish()),
+            Arc::new(seq1.finish()),
+            Arc::new(qual1.finish()),
+            Arc::new(tag2.finish()),
+            Arc::new(seq2.finish()),
+            Arc::new(qual2.finish()),
+        ];
+
+        RecordBatch::try_new(self.schema(), arrays)
+            .map_err(|e| anyhow!("failed to build record batch: {e}"))
     }
 }
 
@@ -261,491 +240,20 @@ impl TableProvider for FastqTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let exec = FastqScanExec::new(
-            self.forward.clone(),
-            self.reverse.clone(),
-            self.schema.clone(),
-            projection.cloned(),
-            limit,
-            self.phred_offset,
-            self.batch_size,
-            self.worker_threads,
-        );
+        let batch = self.read_all_records(limit).map_err(to_df_error)?;
+        let schema = self.schema();
+        let batch = if let Some(projection) = projection {
+            batch
+                .project(projection)
+                .map_err(|e| to_df_error(anyhow!(e.to_string())))?
+        } else {
+            batch
+        };
+
+        let exec = MemoryExec::try_new(&[vec![batch]], schema, projection.cloned())
+            .map_err(|e| to_df_error(anyhow!(e.to_string())))?;
         Ok(Arc::new(exec))
     }
-}
-
-#[cfg(feature = "datafusion")]
-#[derive(Debug)]
-struct FastqScanExec {
-    forward: PathBuf,
-    reverse: PathBuf,
-    schema: SchemaRef,
-    projected_schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    limit: Option<usize>,
-    phred_offset: u8,
-    batch_size: usize,
-    worker_threads: usize,
-    properties: PlanProperties,
-}
-
-#[cfg(feature = "datafusion")]
-impl FastqScanExec {
-    fn new(
-        forward: PathBuf,
-        reverse: PathBuf,
-        schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        limit: Option<usize>,
-        phred_offset: u8,
-        batch_size: usize,
-        worker_threads: usize,
-    ) -> Self {
-        let projected_schema = match &projection {
-            Some(cols) => Arc::new(Schema::new(
-                cols.iter()
-                    .map(|i| schema.field(*i).clone())
-                    .collect::<Vec<_>>(),
-            )),
-            None => schema.clone(),
-        };
-
-        let eq_properties = EquivalenceProperties::new(projected_schema.clone());
-        let properties = PlanProperties::new(
-            eq_properties,
-            Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
-        );
-
-        Self {
-            forward,
-            reverse,
-            schema,
-            projected_schema,
-            projection,
-            limit,
-            phred_offset,
-            batch_size,
-            worker_threads,
-            properties,
-        }
-    }
-}
-
-#[cfg(feature = "datafusion")]
-impl ExecutionPlan for FastqScanExec {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "FastqScanExec"
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Internal(
-                "FastqScanExec does not support children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(
-                "FastqScanExec supports a single partition".to_string(),
-            ));
-        }
-
-        let reader = FastqPairReader::from_paths(&self.forward, &self.reverse, self.phred_offset)
-            .map_err(to_df_error)?;
-
-        let stream = FastqScanStream::new(
-            reader,
-            self.schema.clone(),
-            self.projection.clone(),
-            self.limit,
-            self.batch_size,
-            self.worker_threads,
-            self.phred_offset,
-        );
-
-        let stream = RecordBatchStreamAdapter::new(self.projected_schema.clone(), stream);
-        Ok(Box::pin(stream))
-    }
-
-    fn statistics(&self) -> DFResult<Statistics> {
-        Ok(Statistics::new_unknown(self.projected_schema.as_ref()))
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-}
-
-#[cfg(feature = "datafusion")]
-impl DisplayAs for FastqScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default => write!(f, "FastqScanExec"),
-            DisplayFormatType::Verbose => write!(
-                f,
-                "FastqScanExec: forward={}, reverse={}",
-                self.forward.display(),
-                self.reverse.display()
-            ),
-        }
-    }
-}
-
-#[cfg(feature = "datafusion")]
-struct FastqScanStream {
-    reader: FastqPairReader,
-    _schema: SchemaRef,
-    _projection: Option<Vec<usize>>,
-    limit: Option<usize>,
-    batch_size: usize,
-    rows_emitted: usize,
-    rows_scheduled: usize,
-    next_chunk_id: usize,
-    next_emit_id: usize,
-    reader_exhausted: bool,
-    finished: bool,
-    inflight: usize,
-    max_inflight: usize,
-    task_sender: Option<Sender<Option<ChunkTask>>>,
-    result_receiver: Receiver<Result<ChunkResult, DataFusionError>>,
-    pending: BTreeMap<usize, RecordBatch>,
-    workers: Vec<thread::JoinHandle<()>>,
-    num_workers: usize,
-}
-
-#[cfg(feature = "datafusion")]
-impl FastqScanStream {
-    fn new(
-        reader: FastqPairReader,
-        schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        limit: Option<usize>,
-        batch_size: usize,
-        worker_threads: usize,
-        phred_offset: u8,
-    ) -> Self {
-        let num_workers = if worker_threads == 0 {
-            num_cpus::get().max(1)
-        } else {
-            worker_threads.max(1)
-        };
-        let max_inflight = num_workers * 2;
-
-        let (task_tx, task_rx) = bounded::<Option<ChunkTask>>(max_inflight);
-        let (result_tx, result_rx) = bounded::<Result<ChunkResult, DataFusionError>>(max_inflight);
-
-        let mut workers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let task_rx = task_rx.clone();
-            let result_tx = result_tx.clone();
-            let schema = schema.clone();
-            let projection = projection.clone();
-            let handle = thread::spawn(move || {
-                worker_loop(task_rx, result_tx, schema, projection, phred_offset);
-            });
-            workers.push(handle);
-        }
-
-        Self {
-            reader,
-            _schema: schema.clone(),
-            _projection: projection.clone(),
-            limit,
-            batch_size,
-            rows_emitted: 0,
-            rows_scheduled: 0,
-            next_chunk_id: 0,
-            next_emit_id: 0,
-            reader_exhausted: false,
-            finished: false,
-            inflight: 0,
-            max_inflight,
-            task_sender: Some(task_tx),
-            result_receiver: result_rx,
-            pending: BTreeMap::new(),
-            workers,
-            num_workers,
-        }
-    }
-
-    fn dispatch_chunk(&mut self) -> DFResult<()> {
-        if let Some(limit) = self.limit {
-            if self.rows_emitted + self.rows_scheduled >= limit {
-                self.reader_exhausted = true;
-                self.signal_shutdown();
-                return Ok(());
-            }
-        }
-
-        let mut records = Vec::with_capacity(self.batch_size);
-        while records.len() < self.batch_size {
-            match self.reader.next_pair() {
-                Ok(Some((r1, r2))) => {
-                    records.push((r1, r2));
-                    if let Some(limit) = self.limit {
-                        let remaining = limit.saturating_sub(
-                            self.rows_emitted + self.rows_scheduled + records.len(),
-                        );
-                        if remaining == 0 {
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    self.reader_exhausted = true;
-                    break;
-                }
-                Err(err) => {
-                    self.reader_exhausted = true;
-                    self.signal_shutdown();
-                    return Err(to_df_error(err));
-                }
-            }
-        }
-
-        if records.is_empty() {
-            if self.reader_exhausted {
-                self.signal_shutdown();
-            }
-            return Ok(());
-        }
-
-        if let Some(limit) = self.limit {
-            if self.rows_emitted + self.rows_scheduled + records.len() >= limit {
-                self.reader_exhausted = true;
-            }
-            let remaining = limit.saturating_sub(self.rows_emitted + self.rows_scheduled);
-            if records.len() > remaining {
-                records.truncate(remaining);
-            }
-            if records.is_empty() {
-                self.signal_shutdown();
-                return Ok(());
-            }
-        }
-
-        let task = ChunkTask {
-            id: self.next_chunk_id,
-            records,
-        };
-        self.next_chunk_id += 1;
-        self.rows_scheduled += task.records.len();
-        self.inflight += 1;
-
-        if let Some(sender) = &self.task_sender {
-            sender
-                .send(Some(task))
-                .map_err(|_| DataFusionError::Execution("worker pool disconnected".to_string()))?;
-        }
-
-        Ok(())
-    }
-
-    fn poll_pending(&mut self) -> Option<DFResult<RecordBatch>> {
-        if let Some(mut batch) = self.pending.remove(&self.next_emit_id) {
-            let mut row_count = batch.num_rows();
-            if let Some(limit) = self.limit {
-                if self.rows_emitted + row_count > limit {
-                    let keep = limit - self.rows_emitted;
-                    batch = batch.slice(0, keep);
-                    row_count = keep;
-                    self.finished = true;
-                }
-            }
-
-            self.rows_emitted += row_count;
-            self.rows_scheduled = self.rows_scheduled.saturating_sub(row_count);
-            self.next_emit_id += 1;
-
-            if self.finished {
-                self.signal_shutdown();
-            }
-
-            return Some(Ok(batch));
-        }
-
-        None
-    }
-
-    fn receive_result(&mut self) -> DFResult<()> {
-        match self.result_receiver.recv() {
-            Ok(Ok(result)) => {
-                self.inflight = self.inflight.saturating_sub(1);
-                self.pending.insert(result.id, result.batch);
-                Ok(())
-            }
-            Ok(Err(err)) => {
-                self.inflight = self.inflight.saturating_sub(1);
-                self.signal_shutdown();
-                Err(err)
-            }
-            Err(_) => {
-                self.signal_shutdown();
-                Err(DataFusionError::Execution("worker channel closed".into()))
-            }
-        }
-    }
-
-    fn signal_shutdown(&mut self) {
-        if let Some(sender) = self.task_sender.take() {
-            for _ in 0..self.num_workers {
-                let _ = sender.send(None);
-            }
-        }
-    }
-}
-
-#[cfg(feature = "datafusion")]
-impl Drop for FastqScanStream {
-    fn drop(&mut self) {
-        self.signal_shutdown();
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
-        }
-    }
-}
-
-#[cfg(feature = "datafusion")]
-impl Stream for FastqScanStream {
-    type Item = DFResult<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.finished {
-            return Poll::Ready(None);
-        }
-
-        while !self.reader_exhausted && self.inflight < self.max_inflight {
-            if let Err(err) = self.dispatch_chunk() {
-                self.finished = true;
-                return Poll::Ready(Some(Err(err)));
-            }
-
-            if self.reader_exhausted {
-                break;
-            }
-        }
-
-        if let Some(batch) = self.poll_pending() {
-            return Poll::Ready(Some(batch));
-        }
-
-        if self.reader_exhausted && self.inflight == 0 {
-            self.finished = true;
-            return Poll::Ready(None);
-        }
-
-        if let Err(err) = self.receive_result() {
-            self.finished = true;
-            return Poll::Ready(Some(Err(err)));
-        }
-
-        if let Some(batch) = self.poll_pending() {
-            return Poll::Ready(Some(batch));
-        }
-
-        Poll::Pending
-    }
-}
-
-#[cfg(feature = "datafusion")]
-struct ChunkTask {
-    id: usize,
-    records: Vec<(FastqRecord, FastqRecord)>,
-}
-
-#[cfg(feature = "datafusion")]
-struct ChunkResult {
-    id: usize,
-    batch: RecordBatch,
-}
-
-#[cfg(feature = "datafusion")]
-fn worker_loop(
-    task_rx: Receiver<Option<ChunkTask>>,
-    result_tx: Sender<Result<ChunkResult, DataFusionError>>,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    phred_offset: u8,
-) {
-    while let Ok(message) = task_rx.recv() {
-        match message {
-            Some(task) => {
-                let result = process_chunk(task, schema.clone(), projection.clone(), phred_offset);
-                let _ = result_tx.send(result);
-            }
-            None => break,
-        }
-    }
-}
-
-#[cfg(feature = "datafusion")]
-fn process_chunk(
-    task: ChunkTask,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    phred_offset: u8,
-) -> Result<ChunkResult, DataFusionError> {
-    let mut tag1 = StringBuilder::new();
-    let mut seq1 = StringBuilder::new();
-    let mut qual1 = StringBuilder::new();
-    let mut tag2 = StringBuilder::new();
-    let mut seq2 = StringBuilder::new();
-    let mut qual2 = StringBuilder::new();
-
-    for (r1, r2) in &task.records {
-        tag1.append_value(r1.tag());
-        seq1.append_value(&r1.seq_string());
-        qual1.append_value(&r1.qual_string(phred_offset));
-
-        tag2.append_value(r2.tag());
-        seq2.append_value(&r2.seq_string());
-        qual2.append_value(&r2.qual_string(phred_offset));
-    }
-
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(tag1.finish()),
-        Arc::new(seq1.finish()),
-        Arc::new(qual1.finish()),
-        Arc::new(tag2.finish()),
-        Arc::new(seq2.finish()),
-        Arc::new(qual2.finish()),
-    ];
-
-    let batch = RecordBatch::try_new(schema.clone(), arrays)
-        .map_err(|e| DataFusionError::ArrowError(e, None))?;
-    let batch = if let Some(projection) = projection {
-        batch
-            .project(&projection)
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?
-    } else {
-        batch
-    };
-
-    Ok(ChunkResult { id: task.id, batch })
 }
 
 #[cfg(feature = "datafusion")]
@@ -758,14 +266,10 @@ impl FlashDistributedJob {
     }
 
     pub fn fastq_table_provider(&self) -> FastqTableProvider {
-        let batch_size = self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
-        let workers = self.config.worker_threads.unwrap_or(DEFAULT_WORKER_THREADS);
         FastqTableProvider::new(
             self.config.forward.clone(),
             self.config.reverse.clone(),
             self.params.phred_offset,
-            batch_size,
-            workers,
         )
     }
 
@@ -785,8 +289,7 @@ impl FlashDistributedJob {
         df.into_optimized_plan().map_err(|e| anyhow!(e.to_string()))
     }
 
-    /// Build logical plans that produce combined reads and the two not-combined
-    /// FASTQ outputs, emulating FLASH's stages.
+    /// Build logical plans that produce the three FASTQ outputs.
     pub async fn build_flash_plans(&self, ctx: &SessionContext) -> Result<FlashPlans> {
         let df = self.annotated_fastq_df(ctx).await?;
 
@@ -817,28 +320,10 @@ impl FlashDistributedJob {
         })
     }
 
-    /// Execute the FLASH pipeline through DataFusion and materialise the three
-    /// FASTQ outputs.
+    /// Execute the FLASH pipeline through DataFusion and materialise the outputs.
     pub async fn execute_datafusion(&self) -> Result<()> {
         let ctx = self.session_context().await?;
         self.register_fastq_sources(&ctx).await?;
-        let batch_size = self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
-        let workers = self.config.worker_threads.unwrap_or(DEFAULT_WORKER_THREADS);
-        if self.config.batch_size.is_none() {
-            eprintln!("[flash-df] using default batch size: {batch_size}");
-        } else {
-            eprintln!("[flash-df] using batch size: {batch_size}");
-        }
-        if self.config.worker_threads.is_none() || workers == 0 {
-            let resolved = if workers == 0 {
-                num_cpus::get().max(1)
-            } else {
-                workers
-            };
-            eprintln!("[flash-df] using default worker threads: {resolved}");
-        } else {
-            eprintln!("[flash-df] using worker threads: {workers}");
-        }
         let plans = self.build_flash_plans(&ctx).await?;
         self.materialize_plans(&ctx, &plans).await
     }
@@ -891,83 +376,78 @@ impl FlashDistributedJob {
 
         let (combined_path, not1_path, not2_path) = self.output_paths();
 
-        self.write_plan_stream(ctx, &plans.combined, &combined_path, 0, 1, 2)
+        let combined_batches = self.collect_plan_batches(ctx, &plans.combined).await?;
+        self.write_fastq_batches(&combined_path, &combined_batches, 0, 1, 2)?;
+
+        let not1_batches = self
+            .collect_plan_batches(ctx, &plans.not_combined_left)
             .await?;
-        self.write_plan_stream(ctx, &plans.not_combined_left, &not1_path, 0, 1, 2)
+        self.write_fastq_batches(&not1_path, &not1_batches, 0, 1, 2)?;
+
+        let not2_batches = self
+            .collect_plan_batches(ctx, &plans.not_combined_right)
             .await?;
-        self.write_plan_stream(ctx, &plans.not_combined_right, &not2_path, 0, 1, 2)
-            .await?;
+        self.write_fastq_batches(&not2_path, &not2_batches, 0, 1, 2)?;
 
         Ok(())
     }
 
-    async fn write_plan_stream(
+    async fn collect_plan_batches(
         &self,
         ctx: &SessionContext,
         plan: &LogicalPlan,
+    ) -> Result<Vec<RecordBatch>> {
+        ctx.execute_logical_plan(plan.clone())
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?
+            .collect()
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    fn write_fastq_batches(
+        &self,
         path: &Path,
+        batches: &[RecordBatch],
         tag_idx: usize,
         seq_idx: usize,
         qual_idx: usize,
     ) -> Result<()> {
-        let df = ctx
-            .execute_logical_plan(plan.clone())
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        let mut stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-
         let file = File::create(path).map_err(|e| anyhow!(e.to_string()))?;
         let mut writer = BufWriter::new(file);
 
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| anyhow!(e.to_string()))?;
-            self.write_fastq_batch(&mut writer, &batch, tag_idx, seq_idx, qual_idx)?;
+        for batch in batches {
+            let tags = batch
+                .column(tag_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected UTF-8 tag column"))?;
+            let seqs = batch
+                .column(seq_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected UTF-8 sequence column"))?;
+            let quals = batch
+                .column(qual_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected UTF-8 quality column"))?;
+
+            for row in 0..batch.num_rows() {
+                if tags.is_null(row) || seqs.is_null(row) || quals.is_null(row) {
+                    continue;
+                }
+
+                writeln!(writer, "{}", tags.value(row)).map_err(|e| anyhow!(e.to_string()))?;
+                writeln!(writer, "{}", seqs.value(row)).map_err(|e| anyhow!(e.to_string()))?;
+                writer
+                    .write_all(b"+\n")
+                    .map_err(|e| anyhow!(e.to_string()))?;
+                writeln!(writer, "{}", quals.value(row)).map_err(|e| anyhow!(e.to_string()))?;
+            }
         }
 
         writer.flush().map_err(|e| anyhow!(e.to_string()))?;
-        Ok(())
-    }
-
-    fn write_fastq_batch<W: Write>(
-        &self,
-        writer: &mut W,
-        batch: &RecordBatch,
-        tag_idx: usize,
-        seq_idx: usize,
-        qual_idx: usize,
-    ) -> Result<()> {
-        let tags = batch
-            .column(tag_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| anyhow!("expected UTF-8 tag column"))?;
-        let seqs = batch
-            .column(seq_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| anyhow!("expected UTF-8 sequence column"))?;
-        let quals = batch
-            .column(qual_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| anyhow!("expected UTF-8 quality column"))?;
-
-        for row in 0..batch.num_rows() {
-            if tags.is_null(row) || seqs.is_null(row) || quals.is_null(row) {
-                continue;
-            }
-
-            writeln!(writer, "{}", tags.value(row)).map_err(|e| anyhow!(e.to_string()))?;
-            writeln!(writer, "{}", seqs.value(row)).map_err(|e| anyhow!(e.to_string()))?;
-            writer
-                .write_all(b"+\n")
-                .map_err(|e| anyhow!(e.to_string()))?;
-            writeln!(writer, "{}", quals.value(row)).map_err(|e| anyhow!(e.to_string()))?;
-        }
-
         Ok(())
     }
 
@@ -1128,8 +608,8 @@ impl ScalarUDFImpl for FlashStringUdf {
                 FlashStringField::Qual => outcome.combined_qual,
             };
 
-            if let Some(v) = value {
-                builder.append_value(&v);
+            if let Some(text) = value {
+                builder.append_value(text);
             } else {
                 builder.append_null();
             }
@@ -1196,7 +676,7 @@ impl ScalarUDFImpl for FlashBoolUdf {
         let qual2 = as_string_array(&arrays[5])?;
 
         let len = tag1.len();
-        let mut builder = BooleanBuilder::new();
+        let mut builder = BooleanBuilder::with_capacity(len);
 
         for i in 0..len {
             if tag1.is_null(i)
@@ -1206,7 +686,7 @@ impl ScalarUDFImpl for FlashBoolUdf {
                 || seq2.is_null(i)
                 || qual2.is_null(i)
             {
-                builder.append_value(false);
+                builder.append_null();
                 continue;
             }
 
