@@ -822,6 +822,23 @@ impl FlashDistributedJob {
     pub async fn execute_datafusion(&self) -> Result<()> {
         let ctx = self.session_context().await?;
         self.register_fastq_sources(&ctx).await?;
+        let batch_size = self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        let workers = self.config.worker_threads.unwrap_or(DEFAULT_WORKER_THREADS);
+        if self.config.batch_size.is_none() {
+            eprintln!("[flash-df] using default batch size: {batch_size}");
+        } else {
+            eprintln!("[flash-df] using batch size: {batch_size}");
+        }
+        if self.config.worker_threads.is_none() || workers == 0 {
+            let resolved = if workers == 0 {
+                num_cpus::get().max(1)
+            } else {
+                workers
+            };
+            eprintln!("[flash-df] using default worker threads: {resolved}");
+        } else {
+            eprintln!("[flash-df] using worker threads: {workers}");
+        }
         let plans = self.build_flash_plans(&ctx).await?;
         self.materialize_plans(&ctx, &plans).await
     }
