@@ -22,8 +22,40 @@ FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
 FLASH_C_BIN="${FLASH_C_BIN:-${ROOT_DIR}/bin/flash-lowercase-overhang}"
 FLASH_DF_BIN="${FLASH_DF_BIN:-${ROOT_DIR}/target/release/examples/flash_cli}"
 
-FLASH_DF_BATCH_SIZE="${FLASH_DF_BATCH_SIZE:-4096}"
-FLASH_DF_WORKERS="${FLASH_DF_WORKERS:-$(nproc 2>/dev/null || printf '0')}"
+if [[ -z ${FLASH_DF_BATCH_SIZE+x} ]]; then
+  FLASH_DF_BATCH_SIZE=4096
+  FLASH_DF_BATCH_SIZE_SRC="default"
+else
+  FLASH_DF_BATCH_SIZE_SRC="env"
+fi
+
+if ! [[ "$FLASH_DF_BATCH_SIZE" =~ ^[0-9]+$ && "$FLASH_DF_BATCH_SIZE" -gt 0 ]]; then
+  echo "FLASH_DF_BATCH_SIZE must be a positive integer (received '$FLASH_DF_BATCH_SIZE')." >&2
+  exit 1
+fi
+
+if [[ -z ${FLASH_DF_WORKERS+x} ]]; then
+  FLASH_DF_WORKERS=$(nproc 2>/dev/null || printf '0')
+  FLASH_DF_WORKERS_SRC="default"
+else
+  FLASH_DF_WORKERS_SRC="env"
+fi
+
+if ! [[ "$FLASH_DF_WORKERS" =~ ^[0-9]+$ ]]; then
+  echo "FLASH_DF_WORKERS must be a non-negative integer (received '$FLASH_DF_WORKERS')." >&2
+  exit 1
+fi
+
+FLASH_DF_WORKERS_DISPLAY="$FLASH_DF_WORKERS"
+FLASH_DF_WORKERS_NOTE="explicit"
+if [[ "$FLASH_DF_WORKERS" =~ ^[0-9]+$ ]]; then
+  if [[ "$FLASH_DF_WORKERS" -eq 0 ]]; then
+    FLASH_DF_WORKERS_NOTE="auto"
+    FLASH_DF_WORKERS_DISPLAY=$(nproc 2>/dev/null || printf 'auto')
+  fi
+else
+  FLASH_DF_WORKERS_NOTE="custom"
+fi
 
 PROGRAMS=("flash-cli" "flash-lowercase-overhang" "flash-df")
 
@@ -372,6 +404,8 @@ main() {
 
   declare -A results
   declare -A input_sizes
+
+  echo "flash-df config: batch_size=${FLASH_DF_BATCH_SIZE} (${FLASH_DF_BATCH_SIZE_SRC}) workers=${FLASH_DF_WORKERS_DISPLAY} (${FLASH_DF_WORKERS_NOTE})"
 
   for count in "${COUNTS[@]}"; do
     generate_inputs "$count"
