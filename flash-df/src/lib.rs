@@ -99,6 +99,10 @@ const COMBINED_TAG_COL: &str = "combined_tag";
 const COMBINED_SEQ_COL: &str = "combined_seq";
 #[cfg(feature = "datafusion")]
 const COMBINED_QUAL_COL: &str = "combined_qual";
+#[cfg(feature = "datafusion")]
+const DEFAULT_BATCH_SIZE: usize = 2048;
+#[cfg(feature = "datafusion")]
+const DEFAULT_WORKER_THREADS: usize = 0; // 0 => auto detect
 
 /// Configuration for a FLASH job, regardless of which execution backend is
 /// used.
@@ -112,8 +116,10 @@ pub struct FlashJobConfig {
     pub output_dir: PathBuf,
     /// Output prefix (defaults to `out` in the CLI).
     pub output_prefix: String,
-    /// Optional batch size hint for streaming scans.
+    /// Optional batch size hint for streaming scans (pairs per chunk).
     pub batch_size: Option<usize>,
+    /// Optional worker hint for thread pool (defaults to logical CPUs).
+    pub worker_threads: Option<usize>,
 }
 
 impl FlashJobConfig {
@@ -130,12 +136,19 @@ impl FlashJobConfig {
             output_dir: output_dir.as_ref().to_path_buf(),
             output_prefix: output_prefix.into(),
             batch_size: None,
+            worker_threads: None,
         }
     }
 
     /// Override the batch size used when streaming FASTQ rows.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Override the worker thread count used by the streaming scan (set `0` for auto-detect).
+    pub fn with_worker_threads(mut self, workers: usize) -> Self {
+        self.worker_threads = Some(workers);
         self
     }
 }
@@ -179,8 +192,6 @@ impl FlashDistributedJob {
 #[cfg(feature = "datafusion")]
 const FASTQ_TABLE_NAME: &str = "flash_pairs";
 #[cfg(feature = "datafusion")]
-const DEFAULT_BATCH_SIZE: usize = 2048;
-
 #[cfg(feature = "datafusion")]
 fn to_df_error(err: anyhow::Error) -> DataFusionError {
     DataFusionError::Execution(err.to_string())
@@ -193,11 +204,18 @@ pub struct FastqTableProvider {
     phred_offset: u8,
     schema: SchemaRef,
     batch_size: usize,
+    worker_threads: usize,
 }
 
 #[cfg(feature = "datafusion")]
 impl FastqTableProvider {
-    pub fn new(forward: PathBuf, reverse: PathBuf, phred_offset: u8, batch_size: usize) -> Self {
+    pub fn new(
+        forward: PathBuf,
+        reverse: PathBuf,
+        phred_offset: u8,
+        batch_size: usize,
+        worker_threads: usize,
+    ) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tag1", DataType::Utf8, false),
             Field::new("seq1", DataType::Utf8, false),
@@ -212,6 +230,7 @@ impl FastqTableProvider {
             phred_offset,
             schema,
             batch_size,
+            worker_threads,
         }
     }
 
@@ -250,6 +269,7 @@ impl TableProvider for FastqTableProvider {
             limit,
             self.phred_offset,
             self.batch_size,
+            self.worker_threads,
         );
         Ok(Arc::new(exec))
     }
@@ -266,6 +286,7 @@ struct FastqScanExec {
     limit: Option<usize>,
     phred_offset: u8,
     batch_size: usize,
+    worker_threads: usize,
     properties: PlanProperties,
 }
 
@@ -279,6 +300,7 @@ impl FastqScanExec {
         limit: Option<usize>,
         phred_offset: u8,
         batch_size: usize,
+        worker_threads: usize,
     ) -> Self {
         let projected_schema = match &projection {
             Some(cols) => Arc::new(Schema::new(
@@ -305,6 +327,7 @@ impl FastqScanExec {
             limit,
             phred_offset,
             batch_size,
+            worker_threads,
             properties,
         }
     }
@@ -360,6 +383,7 @@ impl ExecutionPlan for FastqScanExec {
             self.projection.clone(),
             self.limit,
             self.batch_size,
+            self.worker_threads,
             self.phred_offset,
         );
 
@@ -421,9 +445,14 @@ impl FastqScanStream {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
         batch_size: usize,
+        worker_threads: usize,
         phred_offset: u8,
     ) -> Self {
-        let num_workers = num_cpus::get().max(1);
+        let num_workers = if worker_threads == 0 {
+            num_cpus::get().max(1)
+        } else {
+            worker_threads.max(1)
+        };
         let max_inflight = num_workers * 2;
 
         let (task_tx, task_rx) = bounded::<Option<ChunkTask>>(max_inflight);
@@ -729,11 +758,14 @@ impl FlashDistributedJob {
     }
 
     pub fn fastq_table_provider(&self) -> FastqTableProvider {
+        let batch_size = self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        let workers = self.config.worker_threads.unwrap_or(DEFAULT_WORKER_THREADS);
         FastqTableProvider::new(
             self.config.forward.clone(),
             self.config.reverse.clone(),
             self.params.phred_offset,
-            self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
+            batch_size,
+            workers,
         )
     }
 

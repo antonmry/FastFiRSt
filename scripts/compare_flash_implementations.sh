@@ -22,6 +22,9 @@ FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
 FLASH_C_BIN="${FLASH_C_BIN:-${ROOT_DIR}/bin/flash-lowercase-overhang}"
 FLASH_DF_BIN="${FLASH_DF_BIN:-${ROOT_DIR}/target/release/examples/flash_cli}"
 
+FLASH_DF_BATCH_SIZE="${FLASH_DF_BATCH_SIZE:-4096}"
+FLASH_DF_WORKERS="${FLASH_DF_WORKERS:-$(nproc 2>/dev/null || printf '0')}"
+
 PROGRAMS=("flash-cli" "flash-lowercase-overhang" "flash-df")
 
 ensure_binaries() {
@@ -134,6 +137,8 @@ run_flash_df() {
     "$r2" \
     "$output_dir" \
     flash \
+    --batch-size "$FLASH_DF_BATCH_SIZE" \
+    --workers "$FLASH_DF_WORKERS" \
     >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
   local end
   end=$(now_ns)

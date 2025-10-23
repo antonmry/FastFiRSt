@@ -33,7 +33,9 @@ FastqPairReader --> FastqScanExec (1 partition)
      `RecordBatch` after running the UDF logic.
    - Results flow back through a `crossbeam-channel`; a priority queue keyed by
      chunk id ensures we emit batches strictly in order.
-   - `FastqScanStream::poll_next` keeps at most `2 * num_cpus` inflight chunks.
+   - `FastqScanStream::poll_next` keeps at most `2 * worker_threads` inflight
+     chunks (configurable via `FlashJobConfig::with_worker_threads`, defaulting
+     to the logical CPU count).
 
 3. **Streaming Writer**
    - `write_plan_stream` now consumes DataFusion’s stream directly and writes
@@ -59,7 +61,7 @@ FastqPairReader --> FastqScanExec (1 partition)
 ## Roadmap
 
 1. **Expose configuration**
-   - Allow CLI/clients to tune chunk size and worker count.
+   - Allow CLI/clients to tune chunk size and worker count. ✅
    - Surface queue depth metrics for observability.
 
 2. **Ballista Integration**
@@ -78,4 +80,3 @@ FastqPairReader --> FastqScanExec (1 partition)
 5. **Resilience**
    - For distributed execution add retry/rewind logic per chunk.
    - Persist chunk metadata to allow resume-after-failure.
-
