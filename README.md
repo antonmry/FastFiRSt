@@ -55,6 +55,8 @@ Project goals include:
   DataFusion/Ballista (feature-gated stubs for now).
 - `flash-wasm`: Minimal WebAssembly interface exposing the FLASH merge logic for
   the playground UI.
+- `fastq-gen-cli`: Synthetic FASTQ generator for producing large paired-end
+  datasets to feed the pipeline.
 - `wasm-playground`: Vite/Mantine web playground that can execute SQL queries
   against DataFusion and run FLASH locally in the browser.
 
@@ -88,6 +90,34 @@ Outputs are written to `<prefix>.extendedFrags.fastq`,
 `<prefix>.notCombined_1.fastq`, and `<prefix>.notCombined_2.fastq` in the given
 directory. Optional parameters default to the FLASH values; run
 `cargo run --bin flash-cli -- --help` for the full list.
+
+### FASTQ generator CLI
+
+The `fastq-gen-cli` crate produces synthetic paired FASTQ files with tunable
+record counts, read length, and output names. This is useful for benchmarking
+and integration testing without sharing private sequencing data.
+
+```bash
+# Generate 1M paired reads with a 150bp read length
+cargo run -p fastq-gen-cli --release -- \
+  --num-sequences 1000000 \
+  --output-r1 synthetic_R1.fastq \
+  --output-r2 synthetic_R2.fastq
+```
+
+Defaults write to `generated_R1.fastq` / `generated_R2.fastq` and use a 150bp
+read length:
+
+```bash
+cargo run -p fastq-gen-cli -- -n 1000
+```
+
+To plug into the FLASH pipeline with the bundled sample data:
+
+```bash
+cargo run -p fastq-gen-cli -- -n 500 --output-r1 input1.fq --output-r2 input2.fq
+cargo run --bin flash-cli -- input1.fq input2.fq --output-dir ./out
+```
 
 ## Library usage
 

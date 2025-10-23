@@ -50,3 +50,4 @@
 - Reused the base `vscode` user by renaming it to `app` so UID/GID stay 1000 and workspace permissions line up with host mounts.
 - Added `scripts/build_flash_lowercase_overhang.sh` to clone and build the upstream FLASH lowercase overhang fork, publishing the executable to `bin/flash-lowercase-overhang` for container use.
 - Created the `fastq-gen-cli` workspace member to emit synthetic paired-end FASTQ files with configurable record counts, read length, and output paths.
+- Documented the generator usage in the README and added unit coverage that checks record formatting plus end-to-end file emission.
