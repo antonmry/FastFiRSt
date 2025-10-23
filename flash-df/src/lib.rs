@@ -16,12 +16,16 @@ use flash_lib::{CombineParams, merge_fastq_files};
 
 #[cfg(feature = "datafusion")]
 use anyhow::anyhow;
+#[cfg(feature = "datafusion")]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "datafusion")]
 use std::{any::Any, sync::Arc};
 
 #[cfg(feature = "datafusion")]
 use async_trait::async_trait;
+#[cfg(feature = "datafusion")]
+use crossbeam_channel::{Receiver, Sender, bounded};
 #[cfg(feature = "datafusion")]
 use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, StringArray, StringBuilder};
 #[cfg(feature = "datafusion")]
@@ -65,6 +69,8 @@ use flash_lib::FastqPairReader;
 #[cfg(feature = "datafusion")]
 use futures::{Stream, StreamExt};
 #[cfg(feature = "datafusion")]
+use num_cpus;
+#[cfg(feature = "datafusion")]
 use std::fmt;
 #[cfg(feature = "datafusion")]
 use std::fs::{self, File};
@@ -74,6 +80,8 @@ use std::io::{BufWriter, Write};
 use std::pin::Pin;
 #[cfg(feature = "datafusion")]
 use std::task::{Context, Poll};
+#[cfg(feature = "datafusion")]
+use std::thread;
 
 #[cfg(feature = "datafusion")]
 const FLASH_COMBINED_TAG_UDF: &str = "flash_combined_tag";
@@ -386,13 +394,23 @@ impl DisplayAs for FastqScanExec {
 #[cfg(feature = "datafusion")]
 struct FastqScanStream {
     reader: FastqPairReader,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
+    _schema: SchemaRef,
+    _projection: Option<Vec<usize>>,
     limit: Option<usize>,
     batch_size: usize,
     rows_emitted: usize,
+    rows_scheduled: usize,
+    next_chunk_id: usize,
+    next_emit_id: usize,
+    reader_exhausted: bool,
     finished: bool,
-    builder: FastqBatchBuilder,
+    inflight: usize,
+    max_inflight: usize,
+    task_sender: Option<Sender<Option<ChunkTask>>>,
+    result_receiver: Receiver<Result<ChunkResult, DataFusionError>>,
+    pending: BTreeMap<usize, RecordBatch>,
+    workers: Vec<thread::JoinHandle<()>>,
+    num_workers: usize,
 }
 
 #[cfg(feature = "datafusion")]
@@ -405,15 +423,179 @@ impl FastqScanStream {
         batch_size: usize,
         phred_offset: u8,
     ) -> Self {
+        let num_workers = num_cpus::get().max(1);
+        let max_inflight = num_workers * 2;
+
+        let (task_tx, task_rx) = bounded::<Option<ChunkTask>>(max_inflight);
+        let (result_tx, result_rx) = bounded::<Result<ChunkResult, DataFusionError>>(max_inflight);
+
+        let mut workers = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let task_rx = task_rx.clone();
+            let result_tx = result_tx.clone();
+            let schema = schema.clone();
+            let projection = projection.clone();
+            let handle = thread::spawn(move || {
+                worker_loop(task_rx, result_tx, schema, projection, phred_offset);
+            });
+            workers.push(handle);
+        }
+
         Self {
             reader,
-            schema,
-            projection,
+            _schema: schema.clone(),
+            _projection: projection.clone(),
             limit,
             batch_size,
             rows_emitted: 0,
+            rows_scheduled: 0,
+            next_chunk_id: 0,
+            next_emit_id: 0,
+            reader_exhausted: false,
             finished: false,
-            builder: FastqBatchBuilder::new(phred_offset),
+            inflight: 0,
+            max_inflight,
+            task_sender: Some(task_tx),
+            result_receiver: result_rx,
+            pending: BTreeMap::new(),
+            workers,
+            num_workers,
+        }
+    }
+
+    fn dispatch_chunk(&mut self) -> DFResult<()> {
+        if let Some(limit) = self.limit {
+            if self.rows_emitted + self.rows_scheduled >= limit {
+                self.reader_exhausted = true;
+                self.signal_shutdown();
+                return Ok(());
+            }
+        }
+
+        let mut records = Vec::with_capacity(self.batch_size);
+        while records.len() < self.batch_size {
+            match self.reader.next_pair() {
+                Ok(Some((r1, r2))) => {
+                    records.push((r1, r2));
+                    if let Some(limit) = self.limit {
+                        let remaining = limit.saturating_sub(
+                            self.rows_emitted + self.rows_scheduled + records.len(),
+                        );
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.reader_exhausted = true;
+                    break;
+                }
+                Err(err) => {
+                    self.reader_exhausted = true;
+                    self.signal_shutdown();
+                    return Err(to_df_error(err));
+                }
+            }
+        }
+
+        if records.is_empty() {
+            if self.reader_exhausted {
+                self.signal_shutdown();
+            }
+            return Ok(());
+        }
+
+        if let Some(limit) = self.limit {
+            if self.rows_emitted + self.rows_scheduled + records.len() >= limit {
+                self.reader_exhausted = true;
+            }
+            let remaining = limit.saturating_sub(self.rows_emitted + self.rows_scheduled);
+            if records.len() > remaining {
+                records.truncate(remaining);
+            }
+            if records.is_empty() {
+                self.signal_shutdown();
+                return Ok(());
+            }
+        }
+
+        let task = ChunkTask {
+            id: self.next_chunk_id,
+            records,
+        };
+        self.next_chunk_id += 1;
+        self.rows_scheduled += task.records.len();
+        self.inflight += 1;
+
+        if let Some(sender) = &self.task_sender {
+            sender
+                .send(Some(task))
+                .map_err(|_| DataFusionError::Execution("worker pool disconnected".to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    fn poll_pending(&mut self) -> Option<DFResult<RecordBatch>> {
+        if let Some(mut batch) = self.pending.remove(&self.next_emit_id) {
+            let mut row_count = batch.num_rows();
+            if let Some(limit) = self.limit {
+                if self.rows_emitted + row_count > limit {
+                    let keep = limit - self.rows_emitted;
+                    batch = batch.slice(0, keep);
+                    row_count = keep;
+                    self.finished = true;
+                }
+            }
+
+            self.rows_emitted += row_count;
+            self.rows_scheduled = self.rows_scheduled.saturating_sub(row_count);
+            self.next_emit_id += 1;
+
+            if self.finished {
+                self.signal_shutdown();
+            }
+
+            return Some(Ok(batch));
+        }
+
+        None
+    }
+
+    fn receive_result(&mut self) -> DFResult<()> {
+        match self.result_receiver.recv() {
+            Ok(Ok(result)) => {
+                self.inflight = self.inflight.saturating_sub(1);
+                self.pending.insert(result.id, result.batch);
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                self.inflight = self.inflight.saturating_sub(1);
+                self.signal_shutdown();
+                Err(err)
+            }
+            Err(_) => {
+                self.signal_shutdown();
+                Err(DataFusionError::Execution("worker channel closed".into()))
+            }
+        }
+    }
+
+    fn signal_shutdown(&mut self) {
+        if let Some(sender) = self.task_sender.take() {
+            for _ in 0..self.num_workers {
+                let _ = sender.send(None);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "datafusion")]
+impl Drop for FastqScanStream {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
         }
     }
 }
@@ -427,144 +609,114 @@ impl Stream for FastqScanStream {
             return Poll::Ready(None);
         }
 
-        let mut reached_limit = false;
-
-        while self.builder.len() < self.batch_size {
-            if let Some(limit) = self.limit {
-                if self.rows_emitted + self.builder.len() >= limit {
-                    reached_limit = true;
-                    break;
-                }
+        while !self.reader_exhausted && self.inflight < self.max_inflight {
+            if let Err(err) = self.dispatch_chunk() {
+                self.finished = true;
+                return Poll::Ready(Some(Err(err)));
             }
 
-            match self.reader.next_pair() {
-                Ok(Some((r1, r2))) => {
-                    self.builder.append(&r1, &r2);
-                }
-                Ok(None) => {
-                    self.finished = true;
-                    break;
-                }
-                Err(err) => {
-                    self.finished = true;
-                    return Poll::Ready(Some(Err(to_df_error(err))));
-                }
+            if self.reader_exhausted {
+                break;
             }
         }
 
-        if self.builder.is_empty() {
+        if let Some(batch) = self.poll_pending() {
+            return Poll::Ready(Some(batch));
+        }
+
+        if self.reader_exhausted && self.inflight == 0 {
             self.finished = true;
             return Poll::Ready(None);
         }
 
-        let schema = self.schema.clone();
-        let projection = self.projection.clone();
-
-        match self.builder.take_batch(&schema, projection) {
-            Ok(batch) => {
-                self.rows_emitted += batch.num_rows();
-                if reached_limit {
-                    self.finished = true;
-                } else if let Some(limit) = self.limit {
-                    if self.rows_emitted >= limit {
-                        self.finished = true;
-                    }
-                }
-                Poll::Ready(Some(Ok(batch)))
-            }
-            Err(err) => {
-                self.finished = true;
-                Poll::Ready(Some(Err(err)))
-            }
+        if let Err(err) = self.receive_result() {
+            self.finished = true;
+            return Poll::Ready(Some(Err(err)));
         }
+
+        if let Some(batch) = self.poll_pending() {
+            return Poll::Ready(Some(batch));
+        }
+
+        Poll::Pending
     }
 }
 
 #[cfg(feature = "datafusion")]
-struct FastqBatchBuilder {
-    tag1: StringBuilder,
-    seq1: StringBuilder,
-    qual1: StringBuilder,
-    tag2: StringBuilder,
-    seq2: StringBuilder,
-    qual2: StringBuilder,
-    rows: usize,
+struct ChunkTask {
+    id: usize,
+    records: Vec<(FastqRecord, FastqRecord)>,
+}
+
+#[cfg(feature = "datafusion")]
+struct ChunkResult {
+    id: usize,
+    batch: RecordBatch,
+}
+
+#[cfg(feature = "datafusion")]
+fn worker_loop(
+    task_rx: Receiver<Option<ChunkTask>>,
+    result_tx: Sender<Result<ChunkResult, DataFusionError>>,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
     phred_offset: u8,
+) {
+    while let Ok(message) = task_rx.recv() {
+        match message {
+            Some(task) => {
+                let result = process_chunk(task, schema.clone(), projection.clone(), phred_offset);
+                let _ = result_tx.send(result);
+            }
+            None => break,
+        }
+    }
 }
 
 #[cfg(feature = "datafusion")]
-impl FastqBatchBuilder {
-    fn new(phred_offset: u8) -> Self {
-        Self {
-            tag1: StringBuilder::new(),
-            seq1: StringBuilder::new(),
-            qual1: StringBuilder::new(),
-            tag2: StringBuilder::new(),
-            seq2: StringBuilder::new(),
-            qual2: StringBuilder::new(),
-            rows: 0,
-            phred_offset,
-        }
+fn process_chunk(
+    task: ChunkTask,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    phred_offset: u8,
+) -> Result<ChunkResult, DataFusionError> {
+    let mut tag1 = StringBuilder::new();
+    let mut seq1 = StringBuilder::new();
+    let mut qual1 = StringBuilder::new();
+    let mut tag2 = StringBuilder::new();
+    let mut seq2 = StringBuilder::new();
+    let mut qual2 = StringBuilder::new();
+
+    for (r1, r2) in &task.records {
+        tag1.append_value(r1.tag());
+        seq1.append_value(&r1.seq_string());
+        qual1.append_value(&r1.qual_string(phred_offset));
+
+        tag2.append_value(r2.tag());
+        seq2.append_value(&r2.seq_string());
+        qual2.append_value(&r2.qual_string(phred_offset));
     }
 
-    fn append(&mut self, r1: &FastqRecord, r2: &FastqRecord) {
-        let seq1_str = r1.seq_string();
-        let qual1_str = r1.qual_string(self.phred_offset);
-        let seq2_str = r2.seq_string();
-        let qual2_str = r2.qual_string(self.phred_offset);
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(tag1.finish()),
+        Arc::new(seq1.finish()),
+        Arc::new(qual1.finish()),
+        Arc::new(tag2.finish()),
+        Arc::new(seq2.finish()),
+        Arc::new(qual2.finish()),
+    ];
 
-        self.tag1.append_value(r1.tag());
-        self.seq1.append_value(&seq1_str);
-        self.qual1.append_value(&qual1_str);
+    let batch = RecordBatch::try_new(schema.clone(), arrays)
+        .map_err(|e| DataFusionError::ArrowError(e, None))?;
+    let batch = if let Some(projection) = projection {
+        batch
+            .project(&projection)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?
+    } else {
+        batch
+    };
 
-        self.tag2.append_value(r2.tag());
-        self.seq2.append_value(&seq2_str);
-        self.qual2.append_value(&qual2_str);
-
-        self.rows += 1;
-    }
-
-    fn len(&self) -> usize {
-        self.rows
-    }
-
-    fn is_empty(&self) -> bool {
-        self.rows == 0
-    }
-
-    fn take_batch(
-        &mut self,
-        schema: &SchemaRef,
-        projection: Option<Vec<usize>>,
-    ) -> DFResult<RecordBatch> {
-        let mut tag1_builder = std::mem::replace(&mut self.tag1, StringBuilder::new());
-        let mut seq1_builder = std::mem::replace(&mut self.seq1, StringBuilder::new());
-        let mut qual1_builder = std::mem::replace(&mut self.qual1, StringBuilder::new());
-        let mut tag2_builder = std::mem::replace(&mut self.tag2, StringBuilder::new());
-        let mut seq2_builder = std::mem::replace(&mut self.seq2, StringBuilder::new());
-        let mut qual2_builder = std::mem::replace(&mut self.qual2, StringBuilder::new());
-
-        let arrays: Vec<ArrayRef> = vec![
-            Arc::new(tag1_builder.finish()),
-            Arc::new(seq1_builder.finish()),
-            Arc::new(qual1_builder.finish()),
-            Arc::new(tag2_builder.finish()),
-            Arc::new(seq2_builder.finish()),
-            Arc::new(qual2_builder.finish()),
-        ];
-
-        self.rows = 0;
-
-        let batch = RecordBatch::try_new(schema.clone(), arrays)
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-        if let Some(projection) = projection {
-            batch
-                .project(&projection)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))
-        } else {
-            Ok(batch)
-        }
-    }
+    Ok(ChunkResult { id: task.id, batch })
 }
 
 #[cfg(feature = "datafusion")]
