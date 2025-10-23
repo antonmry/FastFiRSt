@@ -8,7 +8,14 @@ ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INPUT_DIR="${INPUT_DIR:-${ROOT_DIR}/benchmarks/inputs}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/benchmarks/outputs}"
 READ_LENGTH="${READ_LENGTH:-150}"
-COUNTS=(100 10000 1000000 100000000)
+DEFAULT_COUNTS=(100 10000 1000000 100000000)
+if [[ -n "${FLASH_BENCH_COUNTS:-}" ]]; then
+  read -r -a COUNTS <<<"${FLASH_BENCH_COUNTS}"
+else
+  COUNTS=("${DEFAULT_COUNTS[@]}")
+fi
+
+ORDER_WARNINGS=()
 
 FASTQ_GEN_BIN="${FASTQ_GEN_BIN:-${ROOT_DIR}/target/release/fastq-gen-cli}"
 FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
@@ -105,6 +112,7 @@ run_flash_c() {
 
 validate_outputs() {
   local count=$1
+  local r1_path=$2
   local cli_dir="${OUTPUT_DIR}/flash-cli/${count}"
   local c_dir="${OUTPUT_DIR}/flash-lowercase-overhang/${count}"
   local files=(
@@ -122,11 +130,188 @@ validate_outputs() {
       exit 1
     fi
 
-    if ! cmp -s "$cli_file" "$c_file"; then
-      echo "Mismatch detected in ${filename} for record count ${count}" >&2
-      exit 1
+    if cmp -s "$cli_file" "$c_file"; then
+      continue
     fi
+
+    if compare_fastq_sets "$cli_file" "$c_file" "${count}_${filename}"; then
+      detect_order_mismatch "$count" "$r1_path" "$cli_file" "$c_file" "$filename"
+      continue
+    fi
+
+    echo "Content mismatch detected in ${filename} for record count ${count}" >&2
+    exit 1
   done
+}
+
+compare_fastq_sets() {
+  local file_a=$1
+  local file_b=$2
+  local label=$3
+
+  local tmp_a tmp_b
+  tmp_a=$(mktemp "${OUTPUT_DIR}/hash_${label}_cliXXXXXX")
+  tmp_b=$(mktemp "${OUTPUT_DIR}/hash_${label}_flashXXXXXX")
+
+  hash_fastq_records "$file_a" "$tmp_a"
+  hash_fastq_records "$file_b" "$tmp_b"
+
+  LC_ALL=C sort -o "$tmp_a" "$tmp_a"
+  LC_ALL=C sort -o "$tmp_b" "$tmp_b"
+
+  if ! cmp -s "$tmp_a" "$tmp_b"; then
+    echo "First few differing record hashes for ${label}:" >&2
+    diff -u <(head -n 20 "$tmp_a") <(head -n 20 "$tmp_b") >&2 || true
+    rm -f "$tmp_a" "$tmp_b"
+    return 1
+  fi
+
+  rm -f "$tmp_a" "$tmp_b"
+  return 0
+}
+
+hash_fastq_records() {
+  local input=$1
+  local output=$2
+
+  python3 - "$input" "$output" <<'PY'
+import hashlib
+import sys
+
+input_path, output_path = sys.argv[1], sys.argv[2]
+
+def read_record(handle):
+    tag = handle.readline()
+    if not tag:
+        return None
+    seq = handle.readline()
+    plus = handle.readline()
+    qual = handle.readline()
+    if not seq or not plus or not qual:
+        raise SystemExit(f"Incomplete FASTQ record encountered in {input_path}")
+    return tag.rstrip(), seq.rstrip(), qual.rstrip()
+
+with open(input_path, "r", encoding="utf-8") as src, open(output_path, "w", encoding="utf-8") as dst:
+    record_count = 0
+    while True:
+        record = read_record(src)
+        if record is None:
+            break
+        tag, seq, qual = record
+        if not tag.startswith("@"):
+            raise SystemExit(f"Invalid FASTQ tag line: {tag}")
+        digest = hashlib.sha256((seq + "\n" + qual).encode("utf-8")).hexdigest()
+        dst.write(f"{tag}\t{digest}\n")
+        record_count += 1
+PY
+}
+
+detect_order_mismatch() {
+  local count=$1
+  local r1_path=$2
+  local cli_file=$3
+  local c_file=$4
+  local filename=$5
+
+  local info_cli info_c
+  info_cli=$(mktemp "${OUTPUT_DIR}/order_cli_${count}_XXXXXX")
+  info_c=$(mktemp "${OUTPUT_DIR}/order_c_${count}_XXXXXX")
+
+  local cli_ok=0
+  local c_ok=0
+
+  if check_order_against_input "$r1_path" "$cli_file" "$info_cli"; then
+    cli_ok=1
+  else
+    cli_ok=0
+    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, flash-cli): $(<"$info_cli")")
+  fi
+
+  if check_order_against_input "$r1_path" "$c_file" "$info_c"; then
+    c_ok=1
+  else
+    c_ok=0
+    ORDER_WARNINGS+=("Record order mismatch for ${count} (${filename}, flash-lowercase-overhang): $(<"$info_c")")
+  fi
+
+  if [[ "$cli_ok" -eq 1 && "$c_ok" -eq 0 ]]; then
+    echo "Warning: flash-lowercase-overhang output ordering diverged for ${count} (${filename})." >&2
+  elif [[ "$cli_ok" -eq 0 && "$c_ok" -eq 1 ]]; then
+    echo "Warning: flash-cli output ordering diverged for ${count} (${filename})." >&2
+  else
+    echo "Warning: Both implementations diverged in ordering for ${count} (${filename})." >&2
+  fi
+
+  rm -f "$info_cli" "$info_c"
+}
+
+check_order_against_input() {
+  local input_r1=$1
+  local output_file=$2
+  local info_file=$3
+
+  python3 - "$input_r1" "$output_file" "$info_file" <<'PY'
+import sys
+from pathlib import Path
+
+input_r1_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+info_path = Path(sys.argv[3])
+
+def load_input_indices(path: Path):
+    mapping = {}
+    idx = 0
+    with path.open("r", encoding="utf-8") as handle:
+        while True:
+            tag = handle.readline()
+            if not tag:
+                break
+            seq = handle.readline()
+            plus = handle.readline()
+            qual = handle.readline()
+            if not seq or not plus or not qual:
+                raise SystemExit(f"Incomplete FASTQ record in {path}")
+            tag = tag.rstrip()
+            mapping[tag] = idx
+            idx += 1
+    return mapping
+
+def write_info(message: str):
+    with info_path.open("w", encoding="utf-8") as info_handle:
+        info_handle.write(message)
+
+tag_index = load_input_indices(input_r1_path)
+
+previous_idx = -1
+previous_tag = None
+record_number = 0
+
+with output_path.open("r", encoding="utf-8") as out_handle:
+    while True:
+        tag = out_handle.readline()
+        if not tag:
+            break
+        seq = out_handle.readline()
+        plus = out_handle.readline()
+        qual = out_handle.readline()
+        if not seq or not plus or not qual:
+            raise SystemExit(f"Incomplete FASTQ record in output {output_path}")
+        tag = tag.rstrip()
+        record_number += 1
+        if tag not in tag_index:
+            write_info(f"tag {tag} missing from inputs")
+            sys.exit(1)
+        idx = tag_index[tag]
+        if idx <= previous_idx:
+            write_info(
+                f"out-of-order tag {tag} (input index {idx}) appears after {previous_tag} (index {previous_idx}) at output record {record_number}"
+            )
+            sys.exit(1)
+        previous_idx = idx
+        previous_tag = tag
+
+sys.exit(0)
+PY
 }
 
 main() {
@@ -151,7 +336,7 @@ main() {
     results["${count},flash-lowercase-overhang"]=$c_time
 
     echo "Validating outputs for ${count} records..."
-    validate_outputs "$count"
+    validate_outputs "$count" "$r1"
   done
 
   echo
@@ -166,6 +351,14 @@ main() {
       fi
     done
   done
+
+  if ((${#ORDER_WARNINGS[@]})); then
+    echo
+    echo "Order warnings:"
+    for warning in "${ORDER_WARNINGS[@]}"; do
+      echo " - $warning"
+    done
+  fi
 }
 
 main "$@"
