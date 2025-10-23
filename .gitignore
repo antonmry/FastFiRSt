@@ -35,5 +35,6 @@ AGENTS.md
 
 # Tests
 *.fq
+*.fastq
 out/
 /wasm-playground/.vite/

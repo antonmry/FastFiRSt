@@ -49,3 +49,4 @@
 - Added `.devcontainer/.dockerignore` to keep the build context small when building Codespaces images.
 - Reused the base `vscode` user by renaming it to `app` so UID/GID stay 1000 and workspace permissions line up with host mounts.
 - Added `scripts/build_flash_lowercase_overhang.sh` to clone and build the upstream FLASH lowercase overhang fork, publishing the executable to `bin/flash-lowercase-overhang` for container use.
+- Created the `fastq-gen-cli` workspace member to emit synthetic paired-end FASTQ files with configurable record counts, read length, and output paths.
