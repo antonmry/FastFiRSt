@@ -8,7 +8,7 @@ ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INPUT_DIR="${INPUT_DIR:-${ROOT_DIR}/benchmarks/inputs}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/benchmarks/outputs}"
 READ_LENGTH="${READ_LENGTH:-150}"
-DEFAULT_COUNTS=(100 10000 1000000)
+DEFAULT_COUNTS=(100 1000 10000 100000 1000000)
 if [[ -n "${FLASH_BENCH_COUNTS:-}" ]]; then
   read -r -a COUNTS <<<"${FLASH_BENCH_COUNTS}"
 else
@@ -319,11 +319,25 @@ main() {
   mkdir -p "$OUTPUT_DIR/flash-cli" "$OUTPUT_DIR/flash-lowercase-overhang"
 
   declare -A results
+  declare -A input_sizes
 
   for count in "${COUNTS[@]}"; do
     generate_inputs "$count"
     local r1="$INPUT_DIR/${count}_R1.fastq"
     local r2="$INPUT_DIR/${count}_R2.fastq"
+
+    local size_mb
+    size_mb=$(
+      python3 - "$r1" "$r2" <<'PY'
+import os
+import sys
+
+r1_path, r2_path = sys.argv[1], sys.argv[2]
+total = os.path.getsize(r1_path) + os.path.getsize(r2_path)
+print(f"{total / (1024 * 1024):.2f}")
+PY
+    )
+    input_sizes["$count"]=$size_mb
 
     echo "Running flash-cli for ${count} records..."
     local cli_time
@@ -341,13 +355,14 @@ main() {
 
   echo
   echo "Benchmark results (seconds):"
-  printf "%-12s %-28s %10s\n" "Records" "Program" "Time"
-  printf "%-12s %-28s %10s\n" "-------" "-------" "----"
+  printf "%-12s %-12s %-28s %10s\n" "Records" "Input(MB)" "Program" "Time(s)"
+  printf "%-12s %-12s %-28s %10s\n" "-------" "----------" "-------" "-------"
   for count in "${COUNTS[@]}"; do
     for program in "flash-cli" "flash-lowercase-overhang"; do
       key="${count},${program}"
       if [[ -n "${results[$key]:-}" ]]; then
-        printf "%-12s %-28s %10s\n" "$count" "$program" "${results[$key]}"
+        printf "%-12s %-12s %-28s %10s\n" \
+          "$count" "${input_sizes[$count]}" "$program" "${results[$key]}"
       fi
     done
   done
