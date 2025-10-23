@@ -29,6 +29,10 @@ notebooks/.ipynb_checkpoints/
 # IA
 AGENTS.md
 
+# External tools
+/bin/
+/third_party/
+
 # Tests
 *.fq
 out/
