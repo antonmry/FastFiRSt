@@ -10,6 +10,10 @@ homepage = "https://github.com/antonmry/FastFiRSt"
 keywords = ["flash", "fastq", "bioinformatics", "cli"]
 categories = ["command-line-utilities", "science"]
 
+[features]
+default = []
+parallel = ["flash-lib/parallel"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }

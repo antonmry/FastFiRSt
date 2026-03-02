@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use flash_lib::{CombineParams, FastqPairReader, combine_pair_from_strs, merge_fastq_files};
+#[cfg(feature = "parallel")]
+use flash_lib::{DEFAULT_BATCH_SIZE, merge_fastq_files_parallel};
 use tempfile::tempdir;
 
 #[test]
@@ -107,6 +109,56 @@ fn combine_pair_from_strs_handles_row() {
         assert!(outcome.combined_seq.is_some());
         assert!(outcome.combined_qual.is_some());
     }
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn reproduces_flash_outputs_for_sample_pair_parallel() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data_dir = manifest_dir.join("../../FLASH-lowercase-overhang");
+    assert!(
+        data_dir.exists(),
+        "reference data directory missing: {:?}",
+        data_dir
+    );
+
+    let input1 = data_dir.join("input1.fq");
+    let input2 = data_dir.join("input2.fq");
+
+    let expected_extended = data_dir.join("out.extendedFrags.fastq");
+    let expected_not1 = data_dir.join("out.notCombined_1.fastq");
+    let expected_not2 = data_dir.join("out.notCombined_2.fastq");
+
+    let tmp_dir = tempdir().expect("failed to create temp dir");
+    let output_dir = tmp_dir.path();
+
+    let params = CombineParams::default();
+    merge_fastq_files_parallel(
+        &input1,
+        &input2,
+        output_dir,
+        "out",
+        &params,
+        DEFAULT_BATCH_SIZE,
+    )
+    .expect("merge_fastq_files_parallel should succeed");
+
+    let produced_extended = output_dir.join("out.extendedFrags.fastq");
+    let produced_not1 = output_dir.join("out.notCombined_1.fastq");
+    let produced_not2 = output_dir.join("out.notCombined_2.fastq");
+
+    assert_eq!(
+        fs::read(&produced_extended).unwrap(),
+        fs::read(&expected_extended).unwrap()
+    );
+    assert_eq!(
+        fs::read(&produced_not1).unwrap(),
+        fs::read(&expected_not1).unwrap()
+    );
+    assert_eq!(
+        fs::read(&produced_not2).unwrap(),
+        fs::read(&expected_not2).unwrap()
+    );
 }
 
 fn count_fastq_records(path: &PathBuf) -> usize {

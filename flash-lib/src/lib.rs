@@ -3,6 +3,11 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+const IO_BUF_SIZE: usize = 256 * 1024;
+const IO_WRITE_BUF_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CombineParams {
@@ -99,6 +104,10 @@ impl FastqRecord {
         self.seq.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.seq.is_empty()
+    }
+
     pub fn tag(&self) -> &str {
         &self.tag
     }
@@ -134,6 +143,10 @@ pub struct FastqPairReader {
     forward_path: PathBuf,
     reverse_path: PathBuf,
     phred_offset: u8,
+    // Reusable line buffers to avoid allocations per record
+    line_buf: Vec<u8>,
+    seq_buf: Vec<u8>,
+    qual_buf: Vec<u8>,
 }
 
 impl FastqPairReader {
@@ -149,18 +162,44 @@ impl FastqPairReader {
         let reverse_file = File::open(&reverse_path)
             .with_context(|| format!("failed to open reverse FASTQ {:?}", reverse_path))?;
 
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(forward_file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+                libc::posix_fadvise(reverse_file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+        }
+
         Ok(Self {
-            forward: BufReader::new(forward_file),
-            reverse: BufReader::new(reverse_file),
+            forward: BufReader::with_capacity(IO_BUF_SIZE, forward_file),
+            reverse: BufReader::with_capacity(IO_BUF_SIZE, reverse_file),
             forward_path,
             reverse_path,
             phred_offset,
+            line_buf: Vec::with_capacity(1024),
+            seq_buf: Vec::with_capacity(512),
+            qual_buf: Vec::with_capacity(512),
         })
     }
 
     pub fn next_pair(&mut self) -> Result<Option<(FastqRecord, FastqRecord)>> {
-        let read1 = read_fastq_record(&mut self.forward, &self.forward_path, self.phred_offset)?;
-        let read2 = read_fastq_record(&mut self.reverse, &self.reverse_path, self.phred_offset)?;
+        let read1 = read_fastq_record(
+            &mut self.forward,
+            &self.forward_path,
+            self.phred_offset,
+            &mut self.line_buf,
+            &mut self.seq_buf,
+            &mut self.qual_buf,
+        )?;
+        let read2 = read_fastq_record(
+            &mut self.reverse,
+            &self.reverse_path,
+            self.phred_offset,
+            &mut self.line_buf,
+            &mut self.seq_buf,
+            &mut self.qual_buf,
+        )?;
 
         match (read1, read2) {
             (Some(r1), Some(r2)) => Ok(Some((r1, r2))),
@@ -192,6 +231,15 @@ pub struct CombineOutcome {
     pub combined_qual: Option<String>,
 }
 
+pub const DEFAULT_BATCH_SIZE: usize = 4096;
+pub const DEFAULT_NUM_THREADS: usize = 2;
+
+#[derive(Debug, Clone)]
+pub enum PairOutcome {
+    Combined(FastqRecord),
+    NotCombined(FastqRecord, FastqRecord),
+}
+
 pub fn combine_pair_from_strs(
     tag1: &str,
     seq1: &str,
@@ -204,8 +252,12 @@ pub fn combine_pair_from_strs(
     let read1 = FastqRecord::from_strs(tag1, seq1, qual1, params.phred_offset)?;
     let read2 = FastqRecord::from_strs(tag2, seq2, qual2, params.phred_offset)?;
 
-    let mut read2_rev = read2.clone();
-    reverse_complement(&mut read2_rev);
+    let mut read2_rev = FastqRecord {
+        tag: String::new(),
+        seq: Vec::with_capacity(read2.seq.len()),
+        qual: Vec::with_capacity(read2.qual.len()),
+    };
+    reverse_complement_into(&read2, &mut read2_rev);
 
     if let Some(mut combined_record) = combine_pair(&read1, &read2_rev, params) {
         let combined_tag = combined_tag(&read1);
@@ -224,6 +276,54 @@ pub fn combine_pair_from_strs(
             combined_qual: None,
         })
     }
+}
+
+pub fn compute_pair(
+    read1: &FastqRecord,
+    read2: &FastqRecord,
+    params: &CombineParams,
+) -> PairOutcome {
+    let mut read2_rev = FastqRecord {
+        tag: String::new(),
+        seq: Vec::with_capacity(read2.seq.len()),
+        qual: Vec::with_capacity(read2.qual.len()),
+    };
+    reverse_complement_into(read2, &mut read2_rev);
+
+    if let Some(mut combined) = combine_pair(read1, &read2_rev, params) {
+        combined.tag = combined_tag(read1);
+        PairOutcome::Combined(combined)
+    } else {
+        PairOutcome::NotCombined(read1.clone(), read2.clone())
+    }
+}
+
+/// Like `compute_pair` but takes ownership — avoids cloning for `NotCombined`.
+/// Uses a thread-local scratch buffer for the reverse complement.
+fn compute_pair_owned(
+    read1: FastqRecord,
+    read2: FastqRecord,
+    params: &CombineParams,
+) -> PairOutcome {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<FastqRecord> = const { std::cell::RefCell::new(FastqRecord {
+            tag: String::new(),
+            seq: Vec::new(),
+            qual: Vec::new(),
+        }) };
+    }
+
+    SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        reverse_complement_into(&read2, &mut scratch);
+
+        if let Some(mut combined) = combine_pair(&read1, &scratch, params) {
+            combined.tag = combined_tag(&read1);
+            PairOutcome::Combined(combined)
+        } else {
+            PairOutcome::NotCombined(read1, read2)
+        }
+    })
 }
 
 pub fn merge_fastq_files(
@@ -248,30 +348,37 @@ pub fn merge_fastq_files(
     let not1_path = output_dir.join(format!("{}.notCombined_1.fastq", output_prefix));
     let not2_path = output_dir.join(format!("{}.notCombined_2.fastq", output_prefix));
 
-    let mut out_extended = BufWriter::new(
+    let mut out_extended = BufWriter::with_capacity(
+        IO_WRITE_BUF_SIZE,
         File::create(&ext_path).with_context(|| format!("failed to create {:?}", ext_path))?,
     );
-    let mut out_not1 = BufWriter::new(
+    let mut out_not1 = BufWriter::with_capacity(
+        IO_WRITE_BUF_SIZE,
         File::create(&not1_path).with_context(|| format!("failed to create {:?}", not1_path))?,
     );
-    let mut out_not2 = BufWriter::new(
+    let mut out_not2 = BufWriter::with_capacity(
+        IO_WRITE_BUF_SIZE,
         File::create(&not2_path).with_context(|| format!("failed to create {:?}", not2_path))?,
     );
 
-    loop {
-        match pair_reader.next_pair()? {
-            Some((r1, r2)) => {
-                process_pair(
-                    &r1,
-                    &r2,
-                    params,
-                    &mut out_extended,
-                    &mut out_not1,
-                    &mut out_not2,
-                )?;
-            }
-            None => break,
-        }
+    let mut scratch = FastqRecord {
+        tag: String::new(),
+        seq: Vec::new(),
+        qual: Vec::new(),
+    };
+    let mut qual_buf = Vec::new();
+
+    while let Some((r1, r2)) = pair_reader.next_pair()? {
+        process_pair_with_scratch(
+            &r1,
+            &r2,
+            params,
+            &mut out_extended,
+            &mut out_not1,
+            &mut out_not2,
+            &mut scratch,
+            &mut qual_buf,
+        )?;
     }
 
     out_extended
@@ -287,89 +394,231 @@ pub fn merge_fastq_files(
     Ok(())
 }
 
-fn process_pair<W: Write>(
+#[cfg(feature = "parallel")]
+pub fn merge_fastq_files_parallel(
+    forward: impl AsRef<Path>,
+    reverse: impl AsRef<Path>,
+    output_dir: impl AsRef<Path>,
+    output_prefix: &str,
+    params: &CombineParams,
+    batch_size: usize,
+    num_threads: usize,
+) -> Result<()> {
+    params.validate()?;
+    ensure!(batch_size > 0, "batch-size must be >= 1");
+    ensure!(num_threads > 0, "num-threads must be >= 1");
+
+    let forward = forward.as_ref();
+    let reverse = reverse.as_ref();
+    let output_dir = output_dir.as_ref();
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create output directory {:?}", output_dir))?;
+
+    let pair_reader = FastqPairReader::from_paths(forward, reverse, params.phred_offset)?;
+
+    let ext_path = output_dir.join(format!("{}.extendedFrags.fastq", output_prefix));
+    let not1_path = output_dir.join(format!("{}.notCombined_1.fastq", output_prefix));
+    let not2_path = output_dir.join(format!("{}.notCombined_2.fastq", output_prefix));
+
+    let mut out_extended = BufWriter::with_capacity(
+        IO_WRITE_BUF_SIZE,
+        File::create(&ext_path).with_context(|| format!("failed to create {:?}", ext_path))?,
+    );
+    let mut out_not1 = BufWriter::with_capacity(
+        IO_WRITE_BUF_SIZE,
+        File::create(&not1_path).with_context(|| format!("failed to create {:?}", not1_path))?,
+    );
+    let mut out_not2 = BufWriter::with_capacity(
+        IO_WRITE_BUF_SIZE,
+        File::create(&not2_path).with_context(|| format!("failed to create {:?}", not2_path))?,
+    );
+
+    let mut qual_buf = Vec::new();
+
+    // Build a custom Rayon pool with limited threads to reduce synchronization overhead.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .context("failed to build Rayon thread pool")?;
+
+    // Double-buffered pipeline: a dedicated reader thread fills the next batch
+    // while the main thread processes + writes the current batch.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(FastqRecord, FastqRecord)>>(1);
+
+    let reader_handle = std::thread::spawn(move || -> Result<()> {
+        let mut reader = pair_reader;
+        loop {
+            let mut batch = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                match reader.next_pair()? {
+                    Some(pair) => batch.push(pair),
+                    None => break,
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            if tx.send(batch).is_err() {
+                break; // receiver dropped
+            }
+        }
+        Ok(())
+    });
+
+    // Main thread: process batches with Rayon pool + write results
+    for batch in rx {
+        let outcomes: Vec<PairOutcome> = pool.install(|| {
+            batch
+                .into_par_iter()
+                .map(|(read1, read2)| compute_pair_owned(read1, read2, params))
+                .collect()
+        });
+
+        for outcome in outcomes {
+            write_outcome(
+                outcome,
+                params.phred_offset,
+                &mut out_extended,
+                &mut out_not1,
+                &mut out_not2,
+                &mut qual_buf,
+            )?;
+        }
+    }
+
+    // Wait for reader thread and propagate any error
+    reader_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
+
+    out_extended
+        .flush()
+        .context("failed to flush extendedFrags writer")?;
+    out_not1
+        .flush()
+        .context("failed to flush notCombined_1 writer")?;
+    out_not2
+        .flush()
+        .context("failed to flush notCombined_2 writer")?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_pair_with_scratch<W: Write>(
     read1: &FastqRecord,
     read2: &FastqRecord,
     params: &CombineParams,
     out_extended: &mut W,
     out_not1: &mut W,
     out_not2: &mut W,
+    scratch: &mut FastqRecord,
+    qual_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let mut read2_rev = read2.clone();
-    reverse_complement(&mut read2_rev);
+    reverse_complement_into(read2, scratch);
 
-    if let Some(mut combined) = combine_pair(read1, &read2_rev, params) {
+    if let Some(mut combined) = combine_pair(read1, scratch, params) {
         combined.tag = combined_tag(read1);
-        write_fastq(out_extended, &combined, params.phred_offset)?;
+        write_fastq(out_extended, &combined, params.phred_offset, qual_buf)?;
     } else {
-        write_fastq(out_not1, read1, params.phred_offset)?;
-        write_fastq(out_not2, read2, params.phred_offset)?;
+        write_fastq(out_not1, read1, params.phred_offset, qual_buf)?;
+        write_fastq(out_not2, read2, params.phred_offset, qual_buf)?;
     }
 
     Ok(())
+}
+
+#[cfg(feature = "parallel")]
+fn write_outcome<W: Write>(
+    outcome: PairOutcome,
+    phred_offset: u8,
+    out_extended: &mut W,
+    out_not1: &mut W,
+    out_not2: &mut W,
+    qual_buf: &mut Vec<u8>,
+) -> Result<()> {
+    match outcome {
+        PairOutcome::Combined(combined) => {
+            write_fastq(out_extended, &combined, phred_offset, qual_buf)?
+        }
+        PairOutcome::NotCombined(read1, read2) => {
+            write_fastq(out_not1, &read1, phred_offset, qual_buf)?;
+            write_fastq(out_not2, &read2, phred_offset, qual_buf)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read one line into `buf` (cleared first), stripping trailing \n and \r.
+/// Returns Ok(0) on EOF.
+#[inline]
+fn read_line_bytes<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    buf.clear();
+    let n = reader.read_until(b'\n', buf)?;
+    // Strip trailing \n and \r
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+        buf.pop();
+    }
+    Ok(n)
 }
 
 fn read_fastq_record<R: BufRead>(
     reader: &mut R,
     source: &Path,
     phred_offset: u8,
+    line_buf: &mut Vec<u8>,
+    seq_buf: &mut Vec<u8>,
+    qual_buf: &mut Vec<u8>,
 ) -> Result<Option<FastqRecord>> {
-    let mut tag_line = String::new();
-    if reader.read_line(&mut tag_line)? == 0 {
+    // Read tag line
+    if read_line_bytes(reader, line_buf)? == 0 {
         return Ok(None);
     }
+    ensure!(
+        !line_buf.is_empty() && line_buf[0] == b'@',
+        "invalid FASTQ tag line in {:?}",
+        source,
+    );
+    // SAFETY: FASTQ tags are ASCII; we accept lossy conversion for non-ASCII edge cases
+    let tag = String::from_utf8_lossy(line_buf).into_owned();
 
-    let mut seq_line = String::new();
-    if reader.read_line(&mut seq_line)? == 0 {
+    // Read sequence line into reusable buffer
+    if read_line_bytes(reader, seq_buf)? == 0 {
         bail!("unexpected EOF reading sequence in {:?}", source);
     }
 
-    let mut plus_line = String::new();
-    if reader.read_line(&mut plus_line)? == 0 {
+    // Read '+' separator
+    if read_line_bytes(reader, line_buf)? == 0 {
         bail!("unexpected EOF reading '+' separator in {:?}", source);
     }
+    ensure!(
+        !line_buf.is_empty() && line_buf[0] == b'+',
+        "invalid FASTQ '+' separator in {:?}",
+        source,
+    );
 
-    let mut qual_line = String::new();
-    if reader.read_line(&mut qual_line)? == 0 {
+    // Read quality line into reusable buffer
+    if read_line_bytes(reader, qual_buf)? == 0 {
         bail!("unexpected EOF reading quality in {:?}", source);
     }
 
-    trim_newline(&mut tag_line);
-    trim_newline(&mut seq_line);
-    trim_newline(&mut plus_line);
-    trim_newline(&mut qual_line);
-
     ensure!(
-        !tag_line.is_empty() && tag_line.starts_with('@'),
-        "invalid FASTQ tag line in {:?}: {}",
-        source,
-        tag_line
-    );
-    ensure!(
-        !plus_line.is_empty() && plus_line.starts_with('+'),
-        "invalid FASTQ '+' separator in {:?}: {}",
-        source,
-        plus_line
-    );
-    ensure!(
-        seq_line.len() == qual_line.len(),
+        seq_buf.len() == qual_buf.len(),
         "sequence and quality lengths differ in {:?}: {} vs {}",
         source,
-        seq_line.len(),
-        qual_line.len()
+        seq_buf.len(),
+        qual_buf.len()
     );
 
-    if seq_line
-        .bytes()
-        .any(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-    {
-        bail!("sequence line contains whitespace in {:?}", source);
+    // Canonicalize sequence in-place
+    for b in seq_buf.iter_mut() {
+        *b = canonical_base(*b);
     }
 
-    let seq: Vec<u8> = seq_line.bytes().map(canonical_base).collect();
-    let mut qual = Vec::with_capacity(qual_line.len());
-    for (idx, byte) in qual_line.bytes().enumerate() {
-        if phred_offset > 0 && byte < phred_offset {
+    // Convert quality in-place
+    for (idx, q) in qual_buf.iter_mut().enumerate() {
+        if phred_offset > 0 && *q < phred_offset {
             bail!(
                 "quality char below PHRED offset ({}) at position {} in {:?}",
                 phred_offset,
@@ -377,66 +626,72 @@ fn read_fastq_record<R: BufRead>(
                 source
             );
         }
-        qual.push(byte.saturating_sub(phred_offset));
+        *q = q.saturating_sub(phred_offset);
     }
 
-    Ok(Some(FastqRecord {
-        tag: tag_line,
-        seq,
-        qual,
-    }))
+    // Take ownership by swapping with empty vecs, avoiding clone
+    let seq = std::mem::take(seq_buf);
+    let qual = std::mem::take(qual_buf);
+
+    Ok(Some(FastqRecord { tag, seq, qual }))
 }
 
-fn trim_newline(line: &mut String) {
-    while matches!(line.chars().last(), Some('\n') | Some('\r')) {
-        line.pop();
-    }
-}
+/// Lookup table: maps any byte to its canonical uppercase base (A/C/G/T/N).
+/// All unrecognised bytes map to N.
+static CANONICAL_BASE_LUT: [u8; 256] = {
+    let mut lut = [b'N'; 256];
+    lut[b'A' as usize] = b'A';
+    lut[b'a' as usize] = b'A';
+    lut[b'C' as usize] = b'C';
+    lut[b'c' as usize] = b'C';
+    lut[b'G' as usize] = b'G';
+    lut[b'g' as usize] = b'G';
+    lut[b'T' as usize] = b'T';
+    lut[b't' as usize] = b'T';
+    lut[b'N' as usize] = b'N';
+    lut[b'n' as usize] = b'N';
+    lut
+};
 
+/// Lookup table: maps a base to its complement (A<->T, C<->G, else N).
+static COMPLEMENT_LUT: [u8; 256] = {
+    let mut lut = [b'N'; 256];
+    lut[b'A' as usize] = b'T';
+    lut[b'T' as usize] = b'A';
+    lut[b'C' as usize] = b'G';
+    lut[b'G' as usize] = b'C';
+    lut
+};
+
+#[inline(always)]
 fn canonical_base(b: u8) -> u8 {
-    match b {
-        b'A' | b'a' => b'A',
-        b'C' | b'c' => b'C',
-        b'G' | b'g' => b'G',
-        b'T' | b't' => b'T',
-        b'N' | b'n' => b'N',
-        _ => b'N',
-    }
+    CANONICAL_BASE_LUT[b as usize]
 }
 
+#[inline(always)]
 fn complement(base: u8) -> u8 {
-    match base {
-        b'A' => b'T',
-        b'T' => b'A',
-        b'C' => b'G',
-        b'G' => b'C',
-        _ => b'N',
-    }
+    COMPLEMENT_LUT[base as usize]
 }
 
 fn to_lower(base: u8) -> u8 {
-    if (b'A'..=b'Z').contains(&base) {
+    if base.is_ascii_uppercase() {
         base + 32
     } else {
         base
     }
 }
 
-fn reverse_complement(read: &mut FastqRecord) {
-    let len = read.seq.len();
-    for i in 0..(len / 2) {
-        let j = len - 1 - i;
-        let base_i = read.seq[i];
-        let base_j = read.seq[j];
-        read.seq[i] = complement(base_j);
-        read.seq[j] = complement(base_i);
-        let qual_i = read.qual[i];
-        read.qual[i] = read.qual[j];
-        read.qual[j] = qual_i;
-    }
-    if len % 2 == 1 {
-        let mid = len / 2;
-        read.seq[mid] = complement(read.seq[mid]);
+/// Write the reverse complement of `src` into `dst`, reusing dst's allocations.
+/// The tag is intentionally NOT copied — callers always overwrite it.
+fn reverse_complement_into(src: &FastqRecord, dst: &mut FastqRecord) {
+    let len = src.seq.len();
+    dst.seq.clear();
+    dst.seq.reserve(len);
+    dst.qual.clear();
+    dst.qual.reserve(len);
+    for i in (0..len).rev() {
+        dst.seq.push(complement(src.seq[i]));
+        dst.qual.push(src.qual[i]);
     }
 }
 
@@ -449,17 +704,17 @@ fn combine_pair(
         evaluate_alignment(read1, read2_rev, params)
             .map(|candidate| (candidate, CombineStatus::CombinedInnie));
 
-    if params.allow_outies {
-        if let Some(candidate) = evaluate_alignment(read2_rev, read1, params) {
-            match &best {
-                None => best = Some((candidate, CombineStatus::CombinedOutie)),
-                Some((best_cand, _)) => {
-                    if candidate.mismatch_density < best_cand.mismatch_density
-                        || (candidate.mismatch_density == best_cand.mismatch_density
-                            && candidate.qual_score < best_cand.qual_score)
-                    {
-                        best = Some((candidate, CombineStatus::CombinedOutie));
-                    }
+    if params.allow_outies
+        && let Some(candidate) = evaluate_alignment(read2_rev, read1, params)
+    {
+        match &best {
+            None => best = Some((candidate, CombineStatus::CombinedOutie)),
+            Some((best_cand, _)) => {
+                if candidate.mismatch_density < best_cand.mismatch_density
+                    || (candidate.mismatch_density == best_cand.mismatch_density
+                        && candidate.qual_score < best_cand.qual_score)
+                {
+                    best = Some((candidate, CombineStatus::CombinedOutie));
                 }
             }
         }
@@ -543,6 +798,213 @@ fn evaluate_alignment(
     })
 }
 
+/// SSE2 fast path: process 16 bytes at a time using SIMD intrinsics.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn compute_mismatch_stats_no_n_sse2(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+) -> MismatchStats {
+    use std::arch::x86_64::*;
+
+    let len = seq1.len();
+    let mut mismatches: u32 = 0;
+    let mut mismatch_qual_total: u32 = 0;
+
+    let chunks = len / 16;
+    let remainder = len % 16;
+
+    for chunk in 0..chunks {
+        let base = chunk * 16;
+        let s1 = _mm_loadu_si128(seq1.as_ptr().add(base) as *const __m128i);
+        let s2 = _mm_loadu_si128(seq2.as_ptr().add(base) as *const __m128i);
+
+        // Compare: 0xFF where equal, 0x00 where different
+        let eq = _mm_cmpeq_epi8(s1, s2);
+        // Bitmask: bit set where bytes are EQUAL
+        let eq_mask = _mm_movemask_epi8(eq) as u32;
+        // Invert: bit set where bytes are DIFFERENT
+        let diff_mask = (!eq_mask) & 0xFFFF;
+        let chunk_mismatches = diff_mask.count_ones();
+        mismatches += chunk_mismatches;
+
+        if chunk_mismatches > 0 {
+            let q1 = _mm_loadu_si128(qual1.as_ptr().add(base) as *const __m128i);
+            let q2 = _mm_loadu_si128(qual2.as_ptr().add(base) as *const __m128i);
+            // min(q1, q2) for unsigned bytes
+            let qmin = _mm_min_epu8(q1, q2);
+            // Zero out positions where bases matched (keep only mismatches)
+            let qmin_masked = _mm_andnot_si128(eq, qmin);
+
+            // Horizontal sum of the 16 bytes in qmin_masked.
+            // SAD (sum of absolute differences) against zero gives us
+            // two 16-bit partial sums in a 128-bit register.
+            let zero = _mm_setzero_si128();
+            let sad = _mm_sad_epu8(qmin_masked, zero);
+            // Extract the two 64-bit lanes which each contain a 16-bit sum
+            let lo = _mm_extract_epi16::<0>(sad) as u32;
+            let hi = _mm_extract_epi16::<4>(sad) as u32;
+            mismatch_qual_total += lo + hi;
+        }
+    }
+
+    // Scalar remainder
+    let tail = chunks * 16;
+    for j in 0..remainder {
+        let i = tail + j;
+        let s1 = *seq1.get_unchecked(i);
+        let s2 = *seq2.get_unchecked(i);
+        if s1 != s2 {
+            mismatches += 1;
+            let q1 = *qual1.get_unchecked(i);
+            let q2 = *qual2.get_unchecked(i);
+            mismatch_qual_total += q1.min(q2) as u32;
+        }
+    }
+
+    MismatchStats {
+        effective_len: len,
+        mismatches,
+        mismatch_qual_total,
+    }
+}
+
+/// NEON fast path for aarch64: process 16 bytes at a time.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn compute_mismatch_stats_no_n_neon(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+) -> MismatchStats {
+    use std::arch::aarch64::*;
+
+    let len = seq1.len();
+    let mut mismatches: u32 = 0;
+    let mut mismatch_qual_total: u32 = 0;
+
+    let chunks = len / 16;
+    let remainder = len % 16;
+
+    for chunk in 0..chunks {
+        let base = chunk * 16;
+        // SAFETY: base + 16 <= len is guaranteed by chunks calculation
+        unsafe {
+            let s1 = vld1q_u8(seq1.as_ptr().add(base));
+            let s2 = vld1q_u8(seq2.as_ptr().add(base));
+
+            // Compare: 0xFF where equal, 0x00 where different
+            let eq = vceqq_u8(s1, s2);
+            // Invert: 0xFF where different
+            let neq = vmvnq_u8(eq);
+
+            // Count mismatches via popcount: each 0xFF byte has 8 set bits
+            let bit_counts = vcntq_u8(neq);
+            let sum16 = vpaddlq_u8(bit_counts);
+            let sum32 = vpaddlq_u16(sum16);
+            let sum64 = vpaddlq_u32(sum32);
+            let total_bits = vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1);
+            let chunk_mismatches = (total_bits / 8) as u32;
+            mismatches += chunk_mismatches;
+
+            if chunk_mismatches > 0 {
+                let q1 = vld1q_u8(qual1.as_ptr().add(base));
+                let q2 = vld1q_u8(qual2.as_ptr().add(base));
+                let qmin = vminq_u8(q1, q2);
+                // Zero out matched positions, keep only mismatch qualities
+                let qmin_masked = vandq_u8(neq, qmin);
+
+                // Horizontal sum of masked quality values
+                let qsum16 = vpaddlq_u8(qmin_masked);
+                let qsum32 = vpaddlq_u16(qsum16);
+                let qsum64 = vpaddlq_u32(qsum32);
+                let qual_sum = vgetq_lane_u64(qsum64, 0) + vgetq_lane_u64(qsum64, 1);
+                mismatch_qual_total += qual_sum as u32;
+            }
+        }
+    }
+
+    // Scalar remainder
+    let tail = chunks * 16;
+    for j in 0..remainder {
+        let i = tail + j;
+        // SAFETY: i < len is guaranteed by remainder calculation
+        unsafe {
+            let s1 = *seq1.get_unchecked(i);
+            let s2 = *seq2.get_unchecked(i);
+            if s1 != s2 {
+                mismatches += 1;
+                let q1 = *qual1.get_unchecked(i);
+                let q2 = *qual2.get_unchecked(i);
+                mismatch_qual_total += q1.min(q2) as u32;
+            }
+        }
+    }
+
+    MismatchStats {
+        effective_len: len,
+        mismatches,
+        mismatch_qual_total,
+    }
+}
+
+/// Scalar fallback.
+#[inline(always)]
+fn compute_mismatch_stats_no_n_scalar(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+) -> MismatchStats {
+    let len = seq1.len();
+    let mut mismatches: u32 = 0;
+    let mut mismatch_qual_total: u32 = 0;
+
+    for i in 0..len {
+        let s1 = unsafe { *seq1.get_unchecked(i) };
+        let s2 = unsafe { *seq2.get_unchecked(i) };
+        if s1 != s2 {
+            mismatches += 1;
+            let q1 = unsafe { *qual1.get_unchecked(i) };
+            let q2 = unsafe { *qual2.get_unchecked(i) };
+            mismatch_qual_total += q1.min(q2) as u32;
+        }
+    }
+
+    MismatchStats {
+        effective_len: len,
+        mismatches,
+        mismatch_qual_total,
+    }
+}
+
+#[inline(always)]
+fn compute_mismatch_stats_no_n(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+) -> MismatchStats {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            // SAFETY: we just checked that SSE2 is available
+            return unsafe { compute_mismatch_stats_no_n_sse2(seq1, seq2, qual1, qual2) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: we just checked that NEON is available
+            return unsafe { compute_mismatch_stats_no_n_neon(seq1, seq2, qual1, qual2) };
+        }
+    }
+    compute_mismatch_stats_no_n_scalar(seq1, seq2, qual1, qual2)
+}
+
 fn compute_mismatch_stats(
     seq1: &[u8],
     seq2: &[u8],
@@ -550,25 +1012,20 @@ fn compute_mismatch_stats(
     qual2: &[u8],
     have_n: bool,
 ) -> MismatchStats {
+    if !have_n {
+        return compute_mismatch_stats_no_n(seq1, seq2, qual1, qual2);
+    }
+
     let mut effective_len = seq1.len();
     let mut mismatches: u32 = 0;
     let mut mismatch_qual_total: u32 = 0;
 
-    if have_n {
-        for i in 0..seq1.len() {
-            if seq1[i] == b'N' || seq2[i] == b'N' {
-                effective_len -= 1;
-            } else if seq1[i] != seq2[i] {
-                mismatches += 1;
-                mismatch_qual_total += qual1[i].min(qual2[i]) as u32;
-            }
-        }
-    } else {
-        for i in 0..seq1.len() {
-            if seq1[i] != seq2[i] {
-                mismatches += 1;
-                mismatch_qual_total += qual1[i].min(qual2[i]) as u32;
-            }
+    for i in 0..seq1.len() {
+        if seq1[i] == b'N' || seq2[i] == b'N' {
+            effective_len -= 1;
+        } else if seq1[i] != seq2[i] {
+            mismatches += 1;
+            mismatch_qual_total += qual1[i].min(qual2[i]) as u32;
         }
     }
 
@@ -663,7 +1120,12 @@ fn combined_tag(read1: &FastqRecord) -> String {
     }
 }
 
-fn write_fastq<W: Write>(writer: &mut W, read: &FastqRecord, phred_offset: u8) -> Result<()> {
+fn write_fastq<W: Write>(
+    writer: &mut W,
+    read: &FastqRecord,
+    phred_offset: u8,
+    qual_buf: &mut Vec<u8>,
+) -> Result<()> {
     writer
         .write_all(read.tag.as_bytes())
         .context("failed to write FASTQ tag")?;
@@ -675,12 +1137,13 @@ fn write_fastq<W: Write>(writer: &mut W, read: &FastqRecord, phred_offset: u8) -
         .write_all(b"\n+\n")
         .context("failed to write FASTQ separator")?;
 
-    let mut qual_buf = Vec::with_capacity(read.qual.len());
+    qual_buf.clear();
+    qual_buf.reserve(read.qual.len());
     for &q in &read.qual {
         qual_buf.push(q + phred_offset);
     }
     writer
-        .write_all(&qual_buf)
+        .write_all(qual_buf)
         .context("failed to write FASTQ quality")?;
     writer.write_all(b"\n").context("failed to write newline")?;
     Ok(())
@@ -691,10 +1154,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trim_newline_removes_crlf() {
-        let mut s = String::from("TAG\r\n");
-        trim_newline(&mut s);
-        assert_eq!(s, "TAG");
+    fn read_line_bytes_strips_crlf() {
+        let data = b"TAG\r\n";
+        let mut cursor = std::io::Cursor::new(&data[..]);
+        let mut buf = Vec::new();
+        let n = read_line_bytes(&mut cursor, &mut buf).unwrap();
+        assert!(n > 0);
+        assert_eq!(&buf, b"TAG");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate FASTQ pairs at several scales, run the three FLASH implementations,
+# Generate FASTQ pairs at several scales, run the FLASH implementations,
 # validate the outputs, and report execution times.
 
 set -euo pipefail
@@ -17,29 +17,26 @@ fi
 FASTQ_GEN_BIN="${FASTQ_GEN_BIN:-${ROOT_DIR}/target/release/fastq-gen-cli}"
 FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
 FLASH_C_BIN="${FLASH_C_BIN:-${ROOT_DIR}/bin/flash-lowercase-overhang}"
-FLASH_DF_BIN="${FLASH_DF_BIN:-${ROOT_DIR}/target/release/examples/flash_cli}"
 
-PROGRAMS=("flash-cli" "flash-lowercase-overhang" "flash-df")
+PROGRAMS=("flash-cli" "flash-cli-parallel" "flash-lowercase-overhang")
 
 ensure_binaries() {
   local need_rust=0
-  if [[ ! -x "$FASTQ_GEN_BIN" || ! -x "$FLASH_CLI_BIN" ]]; then
+  if [[ ! -x "$FASTQ_GEN_BIN" ]]; then
     need_rust=1
   fi
 
   if [[ "$need_rust" -eq 1 ]]; then
-    echo "Building Rust binaries (fastq-gen-cli, flash-cli)..."
-    cargo build --release -p fastq-gen-cli -p flash-cli
+    echo "Building Rust binary (fastq-gen-cli)..."
+    cargo build --release -p fastq-gen-cli
   fi
+
+  echo "Building flash-cli with parallel feature..."
+  cargo build --release -p flash-cli --features parallel
 
   if [[ ! -x "$FLASH_C_BIN" ]]; then
     echo "Building FLASH lowercase overhang binary..."
     "${ROOT_DIR}/scripts/build_flash_lowercase_overhang.sh"
-  fi
-
-  if [[ ! -x "$FLASH_DF_BIN" ]]; then
-    echo "Building flash-df example binary..."
-    cargo build --release -p flash-df --example flash_cli --features datafusion
   fi
 }
 
@@ -51,6 +48,24 @@ elapsed_seconds() {
   local start_ns=$1
   local end_ns=$2
   awk -v start="$start_ns" -v end="$end_ns" 'BEGIN { printf "%.3f", (end-start)/1000000000 }'
+}
+
+# Run a command and return "wall_seconds cpu_seconds" (wall via date, CPU via /usr/bin/time)
+# Usage: run_timed stdout_log stderr_log cmd [args...]
+run_timed() {
+  local stdout_log=$1
+  local stderr_log=$2
+  shift 2
+  local time_file
+  time_file=$(mktemp "${OUTPUT_DIR}/time_XXXXXX")
+  local start end wall_s cpu_s
+  start=$(now_ns)
+  /usr/bin/time -o "$time_file" -f '%U %S' "$@" >"$stdout_log" 2>"$stderr_log"
+  end=$(now_ns)
+  wall_s=$(elapsed_seconds "$start" "$end")
+  cpu_s=$(awk '{ printf "%.3f", $1 + $2 }' "$time_file")
+  rm -f "$time_file"
+  echo "${wall_s} ${cpu_s}"
 }
 
 generate_inputs() {
@@ -81,13 +96,26 @@ run_flash_cli() {
   rm -rf "$output_dir"
   mkdir -p "$output_dir"
 
-  local start=$(now_ns)
-  "$FLASH_CLI_BIN" "$r1" "$r2" \
+  run_timed "$output_dir/stdout.log" "$output_dir/stderr.log" \
+    "$FLASH_CLI_BIN" "$r1" "$r2" \
+    --output-dir "$output_dir" \
+    --output-prefix flash
+}
+
+run_flash_cli_parallel() {
+  local count=$1
+  local r1=$2
+  local r2=$3
+  local output_dir="${OUTPUT_DIR}/flash-cli-parallel/${count}"
+
+  rm -rf "$output_dir"
+  mkdir -p "$output_dir"
+
+  run_timed "$output_dir/stdout.log" "$output_dir/stderr.log" \
+    "$FLASH_CLI_BIN" "$r1" "$r2" \
     --output-dir "$output_dir" \
     --output-prefix flash \
-    >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
-  local end=$(now_ns)
-  elapsed_seconds "$start" "$end"
+    --parallel
 }
 
 run_flash_c() {
@@ -99,33 +127,10 @@ run_flash_c() {
   rm -rf "$output_dir"
   mkdir -p "$output_dir"
 
-  local start=$(now_ns)
-  "$FLASH_C_BIN" "$r1" "$r2" \
+  run_timed "$output_dir/stdout.log" "$output_dir/stderr.log" \
+    "$FLASH_C_BIN" "$r1" "$r2" \
     -d "$output_dir" \
-    -o flash \
-    >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
-  local end=$(now_ns)
-  elapsed_seconds "$start" "$end"
-}
-
-run_flash_df() {
-  local count=$1
-  local r1=$2
-  local r2=$3
-  local output_dir="${OUTPUT_DIR}/flash-df/${count}"
-
-  rm -rf "$output_dir"
-  mkdir -p "$output_dir"
-
-  local start=$(now_ns)
-  "$FLASH_DF_BIN" \
-    "$r1" \
-    "$r2" \
-    "$output_dir" \
-    flash \
-    >"$output_dir/stdout.log" 2>"$output_dir/stderr.log"
-  local end=$(now_ns)
-  elapsed_seconds "$start" "$end"
+    -o flash
 }
 
 validate_against_baseline() {
@@ -340,12 +345,14 @@ PY
 
 main() {
   ensure_binaries
-  mkdir -p "$OUTPUT_DIR/flash-cli" "$OUTPUT_DIR/flash-lowercase-overhang" "$OUTPUT_DIR/flash-df"
+  mkdir -p \
+    "$OUTPUT_DIR/flash-cli" \
+    "$OUTPUT_DIR/flash-cli-parallel" \
+    "$OUTPUT_DIR/flash-lowercase-overhang"
 
-  declare -A results
+  declare -A wall_results
+  declare -A cpu_results
   declare -A input_sizes
-
-  echo "flash-df config: sequential mode"
 
   for count in "${COUNTS[@]}"; do
     generate_inputs "$count"
@@ -364,19 +371,22 @@ PY
     input_sizes["$count"]=$size_mb
 
     echo "Running flash-cli for ${count} records..."
-    local cli_time
-    cli_time=$(run_flash_cli "$count" "$r1" "$r2")
-    results["${count},flash-cli"]=$cli_time
+    local cli_timing
+    cli_timing=$(run_flash_cli "$count" "$r1" "$r2")
+    wall_results["${count},flash-cli"]=${cli_timing% *}
+    cpu_results["${count},flash-cli"]=${cli_timing#* }
 
     echo "Running flash-lowercase-overhang for ${count} records..."
-    local c_time
-    c_time=$(run_flash_c "$count" "$r1" "$r2")
-    results["${count},flash-lowercase-overhang"]=$c_time
+    local c_timing
+    c_timing=$(run_flash_c "$count" "$r1" "$r2")
+    wall_results["${count},flash-lowercase-overhang"]=${c_timing% *}
+    cpu_results["${count},flash-lowercase-overhang"]=${c_timing#* }
 
-    echo "Running flash-df example for ${count} records..."
-    local df_time
-    df_time=$(run_flash_df "$count" "$r1" "$r2")
-    results["${count},flash-df"]=$df_time
+    echo "Running flash-cli (parallel) for ${count} records..."
+    local cli_parallel_timing
+    cli_parallel_timing=$(run_flash_cli_parallel "$count" "$r1" "$r2")
+    wall_results["${count},flash-cli-parallel"]=${cli_parallel_timing% *}
+    cpu_results["${count},flash-cli-parallel"]=${cli_parallel_timing#* }
 
     echo "Validating outputs for ${count} records..."
     local baseline_dir="${OUTPUT_DIR}/flash-cli/${count}"
@@ -385,19 +395,23 @@ PY
       "${OUTPUT_DIR}/flash-lowercase-overhang/${count}" "flash-lowercase-overhang"
     validate_against_baseline \
       "$count" "$r1" "$baseline_dir" "flash-cli" \
-      "${OUTPUT_DIR}/flash-df/${count}" "flash-df"
+      "${OUTPUT_DIR}/flash-cli-parallel/${count}" "flash-cli-parallel"
   done
 
   echo
   echo "Benchmark results (seconds):"
-  printf "%-12s %-12s %-28s %10s\n" "Records" "Input(MB)" "Program" "Time(s)"
-  printf "%-12s %-12s %-28s %10s\n" "-------" "----------" "-------" "-------"
+  printf "%-12s %-12s %-28s %10s %10s %12s\n" "Records" "Input(MB)" "Program" "Wall(s)" "CPU(s)" "CPU/Wall"
+  printf "%-12s %-12s %-28s %10s %10s %12s\n" "-------" "----------" "-------" "-------" "------" "--------"
   for count in "${COUNTS[@]}"; do
     for program in "${PROGRAMS[@]}"; do
       key="${count},${program}"
-      if [[ -n "${results[$key]:-}" ]]; then
-        printf "%-12s %-12s %-28s %10s\n" \
-          "$count" "${input_sizes[$count]}" "$program" "${results[$key]}"
+      if [[ -n "${wall_results[$key]:-}" ]]; then
+        local wall="${wall_results[$key]}"
+        local cpu="${cpu_results[$key]}"
+        local ratio
+        ratio=$(awk -v w="$wall" -v c="$cpu" 'BEGIN { if (w > 0) printf "%.1fx", c/w; else print "N/A" }')
+        printf "%-12s %-12s %-28s %10s %10s %12s\n" \
+          "$count" "${input_sizes[$count]}" "$program" "$wall" "$cpu" "$ratio"
       fi
     done
   done
@@ -409,6 +423,62 @@ PY
       echo " - $warning"
     done
   fi
+
+  # Write JSON results
+  local json_file="${ROOT_DIR}/benchmarks/results.json"
+  {
+    echo '{'
+    echo '  "metadata": {'
+    echo "    \"date\": \"$(date -Iseconds)\","
+    echo "    \"read_length\": ${READ_LENGTH},"
+    echo "    \"hostname\": \"$(hostname)\","
+    echo "    \"uname\": \"$(uname -srm)\""
+    echo '  },'
+    echo '  "programs": ['
+    local first_prog=1
+    for program in "${PROGRAMS[@]}"; do
+      if [[ $first_prog -eq 0 ]]; then echo ','; fi
+      echo -n "    \"${program}\""
+      first_prog=0
+    done
+    echo
+    echo '  ],'
+    echo '  "results": ['
+    local first_entry=1
+    for count in "${COUNTS[@]}"; do
+      for program in "${PROGRAMS[@]}"; do
+        key="${count},${program}"
+        if [[ -n "${wall_results[$key]:-}" ]]; then
+          if [[ $first_entry -eq 0 ]]; then echo ','; fi
+          local wall="${wall_results[$key]}"
+          local cpu="${cpu_results[$key]}"
+          local ratio
+          ratio=$(awk -v w="$wall" -v c="$cpu" 'BEGIN { if (w > 0) printf "%.1f", c/w; else print "0" }')
+          echo -n "    {\"records\": ${count}, \"input_mb\": ${input_sizes[$count]}, \"program\": \"${program}\", \"wall_s\": ${wall}, \"cpu_s\": ${cpu}, \"cpu_wall_ratio\": ${ratio}}"
+          first_entry=0
+        fi
+      done
+    done
+    echo
+    echo '  ],'
+    echo '  "warnings": ['
+    if ((${#ORDER_WARNINGS[@]})); then
+      local first_warn=1
+      for warning in "${ORDER_WARNINGS[@]}"; do
+        if [[ $first_warn -eq 0 ]]; then echo ','; fi
+        # Escape quotes in warning text
+        local escaped
+        escaped=$(echo "$warning" | sed 's/"/\\"/g')
+        echo -n "    \"${escaped}\""
+        first_warn=0
+      done
+      echo
+    fi
+    echo '  ]'
+    echo '}'
+  } > "$json_file"
+  echo
+  echo "JSON results written to ${json_file}"
 }
 
 main "$@"

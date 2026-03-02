@@ -2,11 +2,34 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser};
-use flash_lib::{CombineParams, merge_fastq_files};
+use flash_lib::{CombineParams, DEFAULT_BATCH_SIZE, DEFAULT_NUM_THREADS, merge_fastq_files};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let params = cli.params.into_params();
+
+    if cli.parallel {
+        #[cfg(feature = "parallel")]
+        {
+            return flash_lib::merge_fastq_files_parallel(
+                cli.forward,
+                cli.reverse,
+                cli.output_dir,
+                &cli.output_prefix,
+                &params,
+                cli.batch_size,
+                cli.threads,
+            );
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            anyhow::bail!(
+                "--parallel requested, but this binary was built without the 'parallel' feature"
+            )
+        }
+    }
+
     merge_fastq_files(
         cli.forward,
         cli.reverse,
@@ -41,6 +64,18 @@ struct Cli {
     /// Output prefix (defaults to `out`, matching FLASH)
     #[arg(long, value_name = "PREFIX", default_value = "out")]
     output_prefix: String,
+
+    /// Enable batch-parallel pair processing (requires build with --features parallel)
+    #[arg(long, default_value_t = false)]
+    parallel: bool,
+
+    /// Number of read pairs per parallel batch
+    #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
+    batch_size: usize,
+
+    /// Number of compute threads for parallel mode
+    #[arg(long, default_value_t = DEFAULT_NUM_THREADS)]
+    threads: usize,
 }
 
 #[derive(Args, Debug, Clone)]

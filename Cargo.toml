@@ -11,5 +11,10 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
 [patch.crates-io]
 flash-lib = { path = "flash-lib" }
