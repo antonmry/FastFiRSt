@@ -10,7 +10,10 @@ import jotaiReactRefresh from "jotai/babel/plugin-react-refresh";
 const repoBase = process.env.GITHUB_REPOSITORY?.split("/")[1] ?? "FastFiRSt";
 
 export default defineConfig({
-  base: `/${repoBase}/`,
+  base: `/${repoBase}/playground/`,
+  build: {
+    outDir: "../site/playground",
+  },
   plugins: [
     wasm(),
     topLevelAwait(),

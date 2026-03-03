@@ -41,3 +41,4 @@ out/
 
 # Benchmark artifacts
 /benchmarks/
+.venv-pypy/

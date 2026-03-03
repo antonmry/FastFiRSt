@@ -242,7 +242,8 @@ main() {
   done
 
   # Write JSON results
-  local json_file="${ROOT_DIR}/benchmarks/perf_results.json"
+  mkdir -p "${ROOT_DIR}/site/benchmarks"
+  local json_file="${ROOT_DIR}/site/benchmarks/perf_results.json"
   {
     echo '{'
     echo '  "metadata": {'

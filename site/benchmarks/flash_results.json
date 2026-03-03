@@ -1,0 +1,37 @@
+{
+  "metadata": {
+    "date": "2026-03-03T20:55:40+01:00",
+    "read_length": 150,
+    "hostname": "lima-default",
+    "uname": "Linux 6.17.0-14-generic aarch64"
+  },
+  "programs": [
+    "flash-cli",
+    "flash-cli-parallel",
+    "flash-lowercase-overhang"
+  ],
+  "results": [
+    {"records": 1000, "input_mb": 0.61, "program": "flash-cli", "wall_s": 0.008, "cpu_s": 0.000, "cpu_wall_ratio": 0.0},
+    {"records": 1000, "input_mb": 0.61, "program": "flash-cli-parallel", "wall_s": 0.007, "cpu_s": 0.000, "cpu_wall_ratio": 0.0},
+    {"records": 1000, "input_mb": 0.61, "program": "flash-lowercase-overhang", "wall_s": 0.011, "cpu_s": 0.000, "cpu_wall_ratio": 0.0},
+    {"records": 10000, "input_mb": 6.12, "program": "flash-cli", "wall_s": 0.032, "cpu_s": 0.020, "cpu_wall_ratio": 0.6},
+    {"records": 10000, "input_mb": 6.12, "program": "flash-cli-parallel", "wall_s": 0.028, "cpu_s": 0.030, "cpu_wall_ratio": 1.1},
+    {"records": 10000, "input_mb": 6.12, "program": "flash-lowercase-overhang", "wall_s": 0.029, "cpu_s": 0.080, "cpu_wall_ratio": 2.8},
+    {"records": 100000, "input_mb": 61.23, "program": "flash-cli", "wall_s": 0.292, "cpu_s": 0.260, "cpu_wall_ratio": 0.9},
+    {"records": 100000, "input_mb": 61.23, "program": "flash-cli-parallel", "wall_s": 0.192, "cpu_s": 0.370, "cpu_wall_ratio": 1.9},
+    {"records": 100000, "input_mb": 61.23, "program": "flash-lowercase-overhang", "wall_s": 0.207, "cpu_s": 0.780, "cpu_wall_ratio": 3.8},
+    {"records": 1000000, "input_mb": 612.26, "program": "flash-cli", "wall_s": 2.711, "cpu_s": 2.530, "cpu_wall_ratio": 0.9},
+    {"records": 1000000, "input_mb": 612.26, "program": "flash-cli-parallel", "wall_s": 1.929, "cpu_s": 3.940, "cpu_wall_ratio": 2.0},
+    {"records": 1000000, "input_mb": 612.26, "program": "flash-lowercase-overhang", "wall_s": 1.867, "cpu_s": 7.790, "cpu_wall_ratio": 4.2},
+    {"records": 10000000, "input_mb": 6122.59, "program": "flash-cli", "wall_s": 27.604, "cpu_s": 25.870, "cpu_wall_ratio": 0.9},
+    {"records": 10000000, "input_mb": 6122.59, "program": "flash-cli-parallel", "wall_s": 19.074, "cpu_s": 39.480, "cpu_wall_ratio": 2.1},
+    {"records": 10000000, "input_mb": 6122.59, "program": "flash-lowercase-overhang", "wall_s": 18.526, "cpu_s": 77.670, "cpu_wall_ratio": 4.2}
+  ],
+  "warnings": [
+    "Record order mismatch for 1000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000000617.1 (input index 616) appears after @SEQ0000001000.1 (index 999) at output record 649",
+    "Record order mismatch for 10000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000001585.1 (input index 1584) appears after @SEQ0000001936.1 (index 1935) at output record 1849",
+    "Record order mismatch for 100000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000000001.1 (input index 0) appears after @SEQ0000000176.1 (index 175) at output record 89",
+    "Record order mismatch for 1000000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000001057.1 (input index 1056) appears after @SEQ0000001232.1 (index 1231) at output record 1145",
+    "Record order mismatch for 10000000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000001585.1 (input index 1584) appears after @SEQ0000001760.1 (index 1759) at output record 1673"
+  ]
+}

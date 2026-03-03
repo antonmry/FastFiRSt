@@ -425,7 +425,8 @@ PY
   fi
 
   # Write JSON results
-  local json_file="${ROOT_DIR}/benchmarks/flash_results.json"
+  mkdir -p "${ROOT_DIR}/site/benchmarks"
+  local json_file="${ROOT_DIR}/site/benchmarks/flash_results.json"
   {
     echo '{'
     echo '  "metadata": {'

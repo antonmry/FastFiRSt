@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PERF Benchmark Results</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #ffffff; color: #24292f; padding: 24px; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; color: #1f2328; }
+  .subtitle { font-size: 0.85rem; color: #656d76; margin-bottom: 24px; }
+  .controls { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+  .controls label { font-size: 0.8rem; color: #656d76; }
+  .controls select, .controls input[type="file"] { background: #f6f8fa; color: #24292f; border: 1px solid #d0d7de; border-radius: 6px; padding: 6px 10px; font-size: 0.85rem; }
+  .section { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+  .section h2 { font-size: 1.1rem; color: #1f2328; margin-bottom: 16px; }
+  canvas { width: 100%; max-height: 400px; }
+  .table-controls { display: flex; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+  .table-controls label { font-size: 0.8rem; color: #656d76; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+  .table-controls input[type="checkbox"] { accent-color: #0969da; }
+  .filter-label { font-size: 0.8rem; color: #656d76; font-weight: 600; margin-right: 4px; }
+  .table-search { background: #ffffff; color: #24292f; border: 1px solid #d0d7de; border-radius: 6px; padding: 5px 10px; font-size: 0.8rem; width: 160px; }
+  .table-search::placeholder { color: #8c959f; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { padding: 8px 12px; text-align: right; border-bottom: 1px solid #d8dee4; }
+  th { color: #656d76; font-weight: 600; text-align: right; position: sticky; top: 0; background: #f6f8fa; cursor: pointer; user-select: none; }
+  th:hover { color: #1f2328; }
+  th:first-child, td:first-child { text-align: left; }
+  th .sort-indicator { font-size: 0.7rem; margin-left: 4px; }
+  td.best { color: #1a7f37; font-weight: 600; }
+  .empty { text-align: center; padding: 60px; color: #656d76; }
+  .empty p { margin-bottom: 12px; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; cursor: pointer; padding: 2px 6px; border-radius: 4px; transition: opacity 0.2s; }
+  .legend-item:hover { background: #eaeef2; }
+  .legend-item.disabled { opacity: 0.35; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>PERF Benchmark Results</h1>
+<div class="subtitle" id="metadata"></div>
+
+<div class="controls">
+  <div>
+    <label for="file-input">Load JSON: </label>
+    <input type="file" id="file-input" accept=".json">
+  </div>
+  <div>
+    <label for="metric-select">Metric: </label>
+    <select id="metric-select">
+      <option value="wall_s">Wall Time (s)</option>
+      <option value="cpu_s">CPU Time (s)</option>
+      <option value="cpu_wall_ratio">CPU / Wall Ratio</option>
+    </select>
+  </div>
+  <div>
+    <label for="scale-select">Scale: </label>
+    <select id="scale-select">
+      <option value="linear">Linear</option>
+      <option value="log">Logarithmic</option>
+    </select>
+  </div>
+</div>
+
+<div id="empty-state" class="empty">
+  <p>No data loaded.</p>
+  <p>Use the file picker above to load <code>perf_results.json</code>,<br>or place this file next to <code>perf_results.json</code> and open it via a local server.</p>
+</div>
+
+<div id="content" style="display:none">
+  <div class="section">
+    <h2>Comparison Chart</h2>
+    <div id="legend" class="legend"></div>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="section">
+    <h2>Results Table</h2>
+    <div class="table-controls">
+      <span class="filter-label">Show:</span>
+      <div id="table-filters"></div>
+      <input type="text" class="table-search" id="table-search" placeholder="Filter rows...">
+    </div>
+    <div style="overflow-x: auto;">
+      <table id="results-table">
+        <thead id="table-head"></thead>
+        <tbody id="table-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const COLORS = ['#0969da', '#1a7f37', '#9a6700', '#cf222e', '#8250df', '#0550ae'];
+
+let DATA = null;
+let hiddenPrograms = new Set();
+let tableSortCol = null;
+let tableSortAsc = true;
+let tableFilterText = '';
+
+function init() {
+  document.getElementById('file-input').addEventListener('change', handleFile);
+  document.getElementById('metric-select').addEventListener('change', render);
+  document.getElementById('scale-select').addEventListener('change', render);
+  document.getElementById('table-search').addEventListener('input', e => {
+    tableFilterText = e.target.value.toLowerCase();
+    renderTable();
+  });
+
+  fetch('perf_results.json')
+    .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+    .then(d => { DATA = d; render(); })
+    .catch(() => {});
+}
+
+function handleFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      DATA = JSON.parse(reader.result);
+      hiddenPrograms.clear();
+      render();
+    } catch (err) {
+      alert('Invalid JSON file: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function render() {
+  if (!DATA) return;
+  document.getElementById('empty-state').style.display = 'none';
+  document.getElementById('content').style.display = '';
+
+  renderMetadata();
+  renderLegend();
+  renderChart();
+  renderTableFilters();
+  renderTable();
+}
+
+function renderMetadata() {
+  const m = DATA.metadata || {};
+  const parts = [];
+  if (m.date) parts.push(m.date.split('T')[0]);
+  if (m.hostname) parts.push(m.hostname);
+  if (m.uname) parts.push(m.uname);
+  document.getElementById('metadata').textContent = parts.join(' | ');
+}
+
+function renderLegend() {
+  const programs = DATA.programs || [];
+  const legendEl = document.getElementById('legend');
+  legendEl.innerHTML = '';
+  programs.forEach((prog, i) => {
+    const item = document.createElement('div');
+    item.className = 'legend-item' + (hiddenPrograms.has(prog) ? ' disabled' : '');
+    const swatch = document.createElement('div');
+    swatch.className = 'legend-swatch';
+    swatch.style.background = COLORS[i % COLORS.length];
+    item.appendChild(swatch);
+    item.appendChild(document.createTextNode(prog));
+    item.addEventListener('click', () => {
+      if (hiddenPrograms.has(prog)) {
+        hiddenPrograms.delete(prog);
+      } else {
+        if (hiddenPrograms.size < programs.length - 1) {
+          hiddenPrograms.add(prog);
+        }
+      }
+      renderLegend();
+      renderChart();
+      renderTable();
+    });
+    legendEl.appendChild(item);
+  });
+}
+
+function renderChart() {
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  const metric = document.getElementById('metric-select').value;
+  const logScale = document.getElementById('scale-select').value === 'log';
+
+  const programs = DATA.programs || [];
+  const results = DATA.results || [];
+  const visiblePrograms = programs.filter(p => !hiddenPrograms.has(p));
+
+  const sizes = [...new Set(results.map(r => r.size_mb))].sort((a, b) => a - b);
+
+  const series = visiblePrograms.map(prog => {
+    return sizes.map(size => {
+      const entry = results.find(r => r.size_mb === size && r.program === prog);
+      return { x: size, y: entry ? entry[metric] : null };
+    }).filter(d => d.y !== null && d.y > 0);
+  });
+
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.parentElement.clientWidth - 40;
+  const H = Math.min(400, Math.max(250, W * 0.45));
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  const marginLeft = 70, marginRight = 30, marginTop = 20, marginBottom = 50;
+  const chartW = W - marginLeft - marginRight;
+  const chartH = H - marginTop - marginBottom;
+
+  const allVals = series.flat().map(d => d.y).filter(v => v > 0);
+  if (allVals.length === 0) return;
+  const maxVal = Math.max(...allVals);
+  const minVal = logScale ? Math.min(...allVals) : 0;
+
+  const logSizes = sizes.length > 1 && sizes[sizes.length - 1] / sizes[0] > 10;
+  const xMin = logSizes ? Math.log10(sizes[0] * 0.7) : sizes[0] - (sizes[sizes.length - 1] - sizes[0]) * 0.05 - 0.5;
+  const xMax = logSizes ? Math.log10(sizes[sizes.length - 1] * 1.3) : sizes[sizes.length - 1] + (sizes[sizes.length - 1] - sizes[0]) * 0.05 + 0.5;
+
+  function xPos(size) {
+    const v = logSizes ? Math.log10(size) : size;
+    return marginLeft + (v - xMin) / (xMax - xMin) * chartW;
+  }
+
+  function yPos(val) {
+    if (logScale) {
+      if (val <= 0) val = minVal * 0.5;
+      const logMin = Math.log10(minVal * 0.5);
+      const logMax = Math.log10(maxVal * 1.3);
+      return marginTop + chartH - (Math.log10(val) - logMin) / (logMax - logMin) * chartH;
+    }
+    return marginTop + chartH - (val / (maxVal * 1.15)) * chartH;
+  }
+
+  ctx.strokeStyle = '#d8dee4';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#656d76';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'right';
+
+  const tickCount = 6;
+  for (let i = 0; i <= tickCount; i++) {
+    let val;
+    if (logScale) {
+      const logMin = Math.log10(minVal * 0.5);
+      const logMax = Math.log10(maxVal * 1.3);
+      val = Math.pow(10, logMin + (logMax - logMin) * i / tickCount);
+    } else {
+      val = (maxVal * 1.15) * i / tickCount;
+    }
+    const y = yPos(val);
+    ctx.beginPath();
+    ctx.moveTo(marginLeft, y);
+    ctx.lineTo(W - marginRight, y);
+    ctx.stroke();
+    ctx.fillText(formatValue(val, metric), marginLeft - 6, y + 4);
+  }
+
+  ctx.textAlign = 'center';
+  sizes.forEach(size => {
+    const x = xPos(size);
+    ctx.strokeStyle = '#d8dee4';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, marginTop);
+    ctx.lineTo(x, marginTop + chartH);
+    ctx.stroke();
+
+    ctx.fillStyle = '#656d76';
+    ctx.font = '11px monospace';
+    ctx.fillText(size + 'MB', x, H - marginBottom + 16);
+  });
+
+  visiblePrograms.forEach((prog, si) => {
+    const colorIdx = programs.indexOf(prog);
+    const color = COLORS[colorIdx % COLORS.length];
+    const data = series[si];
+    if (data.length === 0) return;
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    data.forEach((d, i) => {
+      const x = xPos(d.x);
+      const y = yPos(d.y);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    data.forEach(d => {
+      const x = xPos(d.x);
+      const y = yPos(d.y);
+
+      ctx.beginPath();
+      ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.fillStyle = color;
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(formatValue(d.y, metric), x, y - 10);
+    });
+  });
+
+  ctx.save();
+  ctx.translate(14, marginTop + chartH / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillStyle = '#656d76';
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'center';
+  const labels = { wall_s: 'Wall Time (s)', cpu_s: 'CPU Time (s)', cpu_wall_ratio: 'CPU / Wall' };
+  ctx.fillText(labels[metric] || metric, 0, 0);
+  ctx.restore();
+
+  ctx.fillStyle = '#656d76';
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('Input Size (MB)', marginLeft + chartW / 2, H - 4);
+}
+
+function renderTableFilters() {
+  const programs = DATA.programs || [];
+  const container = document.getElementById('table-filters');
+  container.innerHTML = '';
+  programs.forEach((prog, i) => {
+    const lbl = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !hiddenPrograms.has(prog);
+    cb.addEventListener('change', () => {
+      if (cb.checked) {
+        hiddenPrograms.delete(prog);
+      } else {
+        const allProgs = DATA.programs || [];
+        if (hiddenPrograms.size < allProgs.length - 1) {
+          hiddenPrograms.add(prog);
+        } else {
+          cb.checked = true;
+          return;
+        }
+      }
+      renderLegend();
+      renderChart();
+      renderTableFilters();
+      renderTable();
+    });
+    const swatch = document.createElement('span');
+    swatch.style.display = 'inline-block';
+    swatch.style.width = '10px';
+    swatch.style.height = '10px';
+    swatch.style.borderRadius = '2px';
+    swatch.style.background = COLORS[i % COLORS.length];
+    swatch.style.marginRight = '4px';
+    lbl.appendChild(cb);
+    lbl.appendChild(swatch);
+    lbl.appendChild(document.createTextNode(prog));
+    container.appendChild(lbl);
+  });
+}
+
+function renderTable() {
+  const results = DATA.results || [];
+  const programs = (DATA.programs || []).filter(p => !hiddenPrograms.has(p));
+  const sizes = [...new Set(results.map(r => r.size_mb))].sort((a, b) => a - b);
+
+  const columns = [
+    { key: 'size_mb', label: 'Size (MB)' },
+  ];
+  programs.forEach(p => {
+    columns.push({ key: p + '_wall', label: p + ' Wall(s)', prog: p, metric: 'wall_s' });
+    columns.push({ key: p + '_cpu', label: p + ' CPU(s)', prog: p, metric: 'cpu_s' });
+    columns.push({ key: p + '_ratio', label: p + ' CPU/Wall', prog: p, metric: 'cpu_wall_ratio' });
+  });
+
+  let rows = sizes.map(size => {
+    const row = { size_mb: size };
+    const entries = programs.map(p => results.find(r => r.size_mb === size && r.program === p));
+
+    const wallTimes = entries.map(e => e ? e.wall_s : Infinity);
+    const bestWall = Math.min(...wallTimes);
+
+    programs.forEach((p, pi) => {
+      const e = entries[pi];
+      row[p + '_wall'] = e ? e.wall_s : null;
+      row[p + '_cpu'] = e ? e.cpu_s : null;
+      row[p + '_ratio'] = e ? e.cpu_wall_ratio : null;
+      row[p + '_best'] = e && e.wall_s === bestWall;
+    });
+    return row;
+  });
+
+  if (tableFilterText) {
+    rows = rows.filter(r => {
+      return Object.values(r).some(v => {
+        if (v === null || v === undefined) return false;
+        return String(v).toLowerCase().includes(tableFilterText);
+      });
+    });
+  }
+
+  if (tableSortCol !== null) {
+    const col = columns[tableSortCol];
+    rows.sort((a, b) => {
+      let va = a[col.key], vb = b[col.key];
+      if (va === null) va = Infinity;
+      if (vb === null) vb = Infinity;
+      const cmp = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb));
+      return tableSortAsc ? cmp : -cmp;
+    });
+  }
+
+  const thead = document.getElementById('table-head');
+  thead.innerHTML = '';
+  const hr = document.createElement('tr');
+  columns.forEach((col, ci) => {
+    const th = document.createElement('th');
+    th.textContent = col.label;
+    if (tableSortCol === ci) {
+      const ind = document.createElement('span');
+      ind.className = 'sort-indicator';
+      ind.textContent = tableSortAsc ? ' \u25B2' : ' \u25BC';
+      th.appendChild(ind);
+    }
+    th.addEventListener('click', () => {
+      if (tableSortCol === ci) {
+        tableSortAsc = !tableSortAsc;
+      } else {
+        tableSortCol = ci;
+        tableSortAsc = true;
+      }
+      renderTable();
+    });
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+
+  const tbody = document.getElementById('table-body');
+  tbody.innerHTML = '';
+  rows.forEach(row => {
+    const tr = document.createElement('tr');
+    columns.forEach(col => {
+      const td = document.createElement('td');
+      const val = row[col.key];
+      if (val === null || val === undefined) {
+        td.textContent = '-';
+      } else if (col.key === 'size_mb') {
+        td.textContent = val;
+      } else if (col.metric === 'cpu_wall_ratio') {
+        td.textContent = val.toFixed(1) + 'x';
+      } else {
+        td.textContent = val.toFixed(3);
+      }
+      if (col.metric === 'wall_s' && row[col.prog + '_best']) {
+        td.className = 'best';
+      }
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+}
+
+function formatValue(val, metric) {
+  if (metric === 'cpu_wall_ratio') return val.toFixed(1) + 'x';
+  if (val >= 100) return val.toFixed(1);
+  if (val >= 1) return val.toFixed(2);
+  return val.toFixed(3);
+}
+
+init();
+</script>
+</body>
+</html>

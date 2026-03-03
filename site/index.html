@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FastFiRSt</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #ffffff; color: #24292f; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
+  .container { max-width: 640px; width: 100%; }
+  h1 { font-size: 2.4rem; color: #1f2328; margin-bottom: 8px; }
+  .subtitle { font-size: 1rem; color: #656d76; margin-bottom: 48px; line-height: 1.5; }
+  .cards { display: flex; flex-direction: column; gap: 16px; }
+  a.card { display: block; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px; padding: 20px 24px; text-decoration: none; color: #24292f; transition: border-color 0.2s, background 0.2s; }
+  a.card:hover { border-color: #0969da; background: #eef6ff; }
+  .card-title { font-size: 1.1rem; color: #1f2328; font-weight: 600; margin-bottom: 4px; }
+  .card-desc { font-size: 0.85rem; color: #656d76; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>FastFiRSt</h1>
+  <p class="subtitle">Fast FASTQ Implementations in Rust — Sequence Tools</p>
+  <div class="cards">
+    <a class="card" href="playground/">
+      <div class="card-title">WASM Playground</div>
+      <div class="card-desc">Interactive browser-based tool for FASTQ processing powered by WebAssembly.</div>
+    </a>
+    <a class="card" href="benchmarks/flash.html">
+      <div class="card-title">Flash Benchmark Results</div>
+      <div class="card-desc">Performance comparison of FLASH read-merging implementations.</div>
+    </a>
+    <a class="card" href="benchmarks/perf.html">
+      <div class="card-title">PERF Benchmark Results</div>
+      <div class="card-desc">Performance comparison of SSR identification implementations.</div>
+    </a>
+  </div>
+</div>
+</body>
+</html>
