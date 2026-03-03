@@ -57,6 +57,8 @@ Project goals include:
   the playground UI.
 - `fastq-gen-cli`: Synthetic FASTQ generator for producing large paired-end
   datasets to feed the pipeline.
+- `perf-lib`: Core SSR detection library for the PERF port.
+- `perf-cli`: CLI wrapper for running PERF-compatible scans.
 - `wasm-playground`: Vite/Mantine web playground that can execute SQL queries
   against DataFusion and run FLASH locally in the browser.
 
@@ -90,6 +92,19 @@ Outputs are written to `<prefix>.extendedFrags.fastq`,
 `<prefix>.notCombined_1.fastq`, and `<prefix>.notCombined_2.fastq` in the given
 directory. Optional parameters default to the FLASH values; run
 `cargo run --bin flash-cli -- --help` for the full list.
+
+### PERF CLI
+
+```bash
+cargo run --release -p perf-cli -- \
+  -i input.fa \
+  -o input_perf.tsv \
+  --format fasta \
+  -m 1 -M 6 -l 12
+```
+
+Use `--format fastq` for FASTQ aggregate mode. Gzip-compressed input is handled
+automatically.
 
 ### FASTQ generator CLI
 

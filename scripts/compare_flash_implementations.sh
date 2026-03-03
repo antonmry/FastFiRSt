@@ -5,11 +5,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INPUT_DIR="${INPUT_DIR:-${ROOT_DIR}/benchmarks/inputs}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/benchmarks/outputs}"
+INPUT_DIR="${INPUT_DIR:-${ROOT_DIR}/benchmarks/flash_inputs}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/benchmarks/flash_outputs}"
 READ_LENGTH="${READ_LENGTH:-150}"
 
-COUNTS=(100 1000 10000 100000 1000000)
+COUNTS=(1000 10000 100000 1000000 10000000)
 if [[ -n "${FLASH_BENCH_COUNTS:-}" ]]; then
   read -r -a COUNTS <<<"${FLASH_BENCH_COUNTS}"
 fi
@@ -425,7 +425,7 @@ PY
   fi
 
   # Write JSON results
-  local json_file="${ROOT_DIR}/benchmarks/results.json"
+  local json_file="${ROOT_DIR}/benchmarks/flash_results.json"
   {
     echo '{'
     echo '  "metadata": {'

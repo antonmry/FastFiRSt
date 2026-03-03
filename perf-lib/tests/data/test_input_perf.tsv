@@ -1,0 +1,6 @@
+seq1	0	12	AC	12	+	6	AC
+seq2	0	12	A	12	-	12	T
+# file: INPUT_PLACEHOLDER
+# total_sequences: 2
+# total_bases: 28
+# gc_pct: 25.00

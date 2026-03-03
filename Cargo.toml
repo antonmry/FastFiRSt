@@ -5,6 +5,8 @@ members = [
     "flash-df",
     "flash-wasm",
     "fastq-gen-cli",
+    "perf-lib",
+    "perf-cli",
 ]
 resolver = "2"
 
