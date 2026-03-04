@@ -56,6 +56,9 @@
       <option value="wall_s">Wall Time (s)</option>
       <option value="cpu_s">CPU Time (s)</option>
       <option value="cpu_wall_ratio">CPU / Wall Ratio</option>
+      <option value="energy_duration_s">Energy Duration (s)</option>
+      <option value="energy_total_j">Total Energy (J)</option>
+      <option value="energy_avg_total_power_w">Avg Total Power (W)</option>
     </select>
   </div>
   <div>
@@ -160,7 +163,30 @@ function renderMetadata() {
   if (m.hostname) parts.push(m.hostname);
   if (m.uname) parts.push(m.uname);
   if (m.read_length) parts.push('Read length: ' + m.read_length + 'bp');
+  if (m.energy_run_available === true) parts.push('energy-run: enabled');
+  if (m.energy_run_available === false) parts.push('energy-run: unavailable');
   document.getElementById('metadata').textContent = parts.join(' | ');
+}
+
+function getEnergy(entry) {
+  return entry && entry.execution && entry.execution.energy ? entry.execution.energy : null;
+}
+
+function getMetricValue(entry, metric) {
+  if (!entry) return null;
+  if (metric === 'wall_s' || metric === 'cpu_s' || metric === 'cpu_wall_ratio') {
+    return entry[metric] ?? null;
+  }
+  if (metric === 'energy_run_used') {
+    return entry.execution ? (entry.execution.energy_run_used ?? null) : null;
+  }
+
+  const energy = getEnergy(entry);
+  if (!energy) return null;
+  if (metric === 'energy_duration_s') return energy.duration_s ?? null;
+  if (metric === 'energy_total_j') return energy.total_energy_j ?? null;
+  if (metric === 'energy_avg_total_power_w') return energy.avg_total_power_w ?? null;
+  return null;
 }
 
 function renderLegend() {
@@ -206,7 +232,7 @@ function renderChart() {
   const series = visiblePrograms.map(prog => {
     return counts.map(count => {
       const entry = results.find(r => r.records === count && r.program === prog);
-      return { x: count, y: entry ? entry[metric] : null };
+      return { x: count, y: getMetricValue(entry, metric) };
     }).filter(d => d.y !== null && d.y > 0);
   });
 
@@ -331,7 +357,14 @@ function renderChart() {
   ctx.fillStyle = '#656d76';
   ctx.font = '12px monospace';
   ctx.textAlign = 'center';
-  const labels = { wall_s: 'Wall Time (s)', cpu_s: 'CPU Time (s)', cpu_wall_ratio: 'CPU / Wall' };
+  const labels = {
+    wall_s: 'Wall Time (s)',
+    cpu_s: 'CPU Time (s)',
+    cpu_wall_ratio: 'CPU / Wall',
+    energy_duration_s: 'Energy Duration (s)',
+    energy_total_j: 'Total Energy (J)',
+    energy_avg_total_power_w: 'Avg Total Power (W)',
+  };
   ctx.fillText(labels[metric] || metric, 0, 0);
   ctx.restore();
 
@@ -394,6 +427,10 @@ function renderTable() {
     columns.push({ key: p + '_wall', label: p + ' Wall(s)', prog: p, metric: 'wall_s' });
     columns.push({ key: p + '_cpu', label: p + ' CPU(s)', prog: p, metric: 'cpu_s' });
     columns.push({ key: p + '_ratio', label: p + ' CPU/Wall', prog: p, metric: 'cpu_wall_ratio' });
+    columns.push({ key: p + '_energy_used', label: p + ' E-Run', prog: p, metric: 'energy_run_used' });
+    columns.push({ key: p + '_energy_dur', label: p + ' E-Dur(s)', prog: p, metric: 'energy_duration_s' });
+    columns.push({ key: p + '_energy_j', label: p + ' E(J)', prog: p, metric: 'energy_total_j' });
+    columns.push({ key: p + '_energy_w', label: p + ' E-AvgW', prog: p, metric: 'energy_avg_total_power_w' });
   });
 
   let rows = counts.map(count => {
@@ -406,10 +443,14 @@ function renderTable() {
 
     programs.forEach((p, pi) => {
       const e = entries[pi];
-      row[p + '_wall'] = e ? e.wall_s : null;
-      row[p + '_cpu'] = e ? e.cpu_s : null;
-      row[p + '_ratio'] = e ? e.cpu_wall_ratio : null;
-      row[p + '_best'] = e && e.wall_s === bestWall;
+      row[p + '_wall'] = getMetricValue(e, 'wall_s');
+      row[p + '_cpu'] = getMetricValue(e, 'cpu_s');
+      row[p + '_ratio'] = getMetricValue(e, 'cpu_wall_ratio');
+      row[p + '_energy_used'] = getMetricValue(e, 'energy_run_used');
+      row[p + '_energy_dur'] = getMetricValue(e, 'energy_duration_s');
+      row[p + '_energy_j'] = getMetricValue(e, 'energy_total_j');
+      row[p + '_energy_w'] = getMetricValue(e, 'energy_avg_total_power_w');
+      row[p + '_best'] = e && getMetricValue(e, 'wall_s') === bestWall;
     });
     return row;
   });
@@ -472,8 +513,12 @@ function renderTable() {
         td.textContent = val.toLocaleString();
       } else if (col.key === 'input_mb') {
         td.textContent = val.toFixed(2);
+      } else if (col.metric === 'energy_run_used') {
+        td.textContent = val ? 'yes' : 'no';
       } else if (col.metric === 'cpu_wall_ratio') {
         td.textContent = val.toFixed(1) + 'x';
+      } else if (col.metric === 'energy_total_j' || col.metric === 'energy_avg_total_power_w') {
+        td.textContent = val.toFixed(3);
       } else {
         td.textContent = val.toFixed(3);
       }
@@ -502,6 +547,7 @@ function renderWarnings() {
 
 function formatValue(val, metric) {
   if (metric === 'cpu_wall_ratio') return val.toFixed(1) + 'x';
+  if (metric === 'energy_total_j' || metric === 'energy_avg_total_power_w') return val.toFixed(3);
   if (val >= 100) return val.toFixed(1);
   if (val >= 1) return val.toFixed(2);
   return val.toFixed(3);

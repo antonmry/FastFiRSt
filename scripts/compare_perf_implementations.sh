@@ -23,6 +23,14 @@ if command -v "${PYPY_BIN}" >/dev/null 2>&1; then
   PROGRAMS+=("perf-pypy")
 fi
 
+ENERGY_RUN_BIN=""
+ENERGY_RUN_AVAILABLE=0
+ENERGY_RUN_DISABLE_GPU="${ENERGY_RUN_DISABLE_GPU:-1}"
+if command -v energy-run >/dev/null 2>&1; then
+  ENERGY_RUN_BIN="$(command -v energy-run)"
+  ENERGY_RUN_AVAILABLE=1
+fi
+
 now_ns() {
   date +%s%N
 }
@@ -33,20 +41,140 @@ elapsed_seconds() {
   awk -v start="$start_ns" -v end="$end_ns" 'BEGIN { printf "%.3f", (end-start)/1000000000 }'
 }
 
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_bool() {
+  if [[ "$1" == "1" ]]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+fmt_optional_number() {
+  local value=$1
+  local decimals=$2
+  if [[ "$value" == "null" || -z "$value" ]]; then
+    printf 'N/A'
+  else
+    awk -v v="$value" -v d="$decimals" 'BEGIN { printf "%.*f", d, v }'
+  fi
+}
+
+# Emit a tab-separated row:
+# wall_s cpu_s energy_used energy_duration_s energy_cpu_j energy_gpu_j
+# energy_total_j energy_total_kwh energy_avg_cpu_w energy_avg_gpu_w
+# energy_avg_total_w energy_exit_code
 run_timed() {
   local stdout_log=$1
   local stderr_log=$2
   shift 2
+
   local time_file
   time_file=$(mktemp "${OUTPUT_DIR}/time_XXXXXX")
-  local start end wall_s cpu_s
-  start=$(now_ns)
-  /usr/bin/time -o "$time_file" -f '%U %S' "$@" >"$stdout_log" 2>"$stderr_log"
-  end=$(now_ns)
-  wall_s=$(elapsed_seconds "$start" "$end")
-  cpu_s=$(awk '{ printf "%.3f", $1 + $2 }' "$time_file")
-  rm -f "$time_file"
-  echo "${wall_s} ${cpu_s}"
+  local energy_file
+  energy_file=$(mktemp "${OUTPUT_DIR}/energy_XXXXXX.json")
+
+  local wall_s cpu_s cmd_status
+  local energy_used=0
+  local energy_duration="null"
+  local energy_cpu="null"
+  local energy_gpu="null"
+  local energy_total="null"
+  local energy_kwh="null"
+  local energy_avg_cpu="null"
+  local energy_avg_gpu="null"
+  local energy_avg_total="null"
+  local energy_exit="null"
+
+  if [[ "$ENERGY_RUN_AVAILABLE" -eq 1 ]]; then
+    local -a energy_args
+    energy_args=(--output json)
+    if [[ "${ENERGY_RUN_DISABLE_GPU}" == "1" ]]; then
+      energy_args+=(--no-gpu)
+    fi
+
+    set +e
+    /usr/bin/time -o "$time_file" -f '%e %U %S' \
+      "$ENERGY_RUN_BIN" "${energy_args[@]}" -- \
+      bash -c 'stdout_log=$1; stderr_log=$2; shift 2; exec "$@" >"$stdout_log" 2>"$stderr_log"' _ \
+      "$stdout_log" "$stderr_log" "$@" >"$energy_file"
+    cmd_status=$?
+    set -e
+
+    if [[ "$cmd_status" -ne 0 && ! -s "$energy_file" ]]; then
+      echo "Warning: energy-run backend unavailable; retrying with --no-cpu --no-gpu." >&2
+      set +e
+      /usr/bin/time -o "$time_file" -f '%e %U %S' \
+        "$ENERGY_RUN_BIN" --output json --no-cpu --no-gpu -- \
+        bash -c 'stdout_log=$1; stderr_log=$2; shift 2; exec "$@" >"$stdout_log" 2>"$stderr_log"' _ \
+        "$stdout_log" "$stderr_log" "$@" >"$energy_file"
+      cmd_status=$?
+      set -e
+    fi
+
+    if [[ -s "$energy_file" ]]; then
+      energy_used=1
+      local parsed_energy
+      parsed_energy=$(python3 - "$energy_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+def to_field(value):
+    if value is None:
+        return "null"
+    return str(value)
+
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+keys = [
+    "duration_s",
+    "cpu_energy_j",
+    "gpu_energy_j",
+    "total_energy_j",
+    "total_energy_kwh",
+    "avg_cpu_power_w",
+    "avg_gpu_power_w",
+    "avg_total_power_w",
+    "exit_code",
+]
+print("\t".join(to_field(data.get(key)) for key in keys))
+PY
+      )
+      IFS=$'\t' read -r \
+        energy_duration energy_cpu energy_gpu energy_total energy_kwh \
+        energy_avg_cpu energy_avg_gpu energy_avg_total energy_exit <<<"$parsed_energy"
+    elif [[ "$cmd_status" -eq 0 ]]; then
+      set +e
+      /usr/bin/time -o "$time_file" -f '%e %U %S' "$@" >"$stdout_log" 2>"$stderr_log"
+      cmd_status=$?
+      set -e
+    fi
+  else
+    set +e
+    /usr/bin/time -o "$time_file" -f '%e %U %S' "$@" >"$stdout_log" 2>"$stderr_log"
+    cmd_status=$?
+    set -e
+  fi
+
+  wall_s=$(awk '{ printf "%.3f", $1 }' "$time_file")
+  cpu_s=$(awk '{ printf "%.3f", $2 + $3 }' "$time_file")
+  rm -f "$time_file" "$energy_file"
+
+  if [[ "$cmd_status" -ne 0 ]]; then
+    echo "Command failed with exit code ${cmd_status}: $*" >&2
+    return "$cmd_status"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$wall_s" "$cpu_s" "$energy_used" "$energy_duration" "$energy_cpu" "$energy_gpu" \
+    "$energy_total" "$energy_kwh" "$energy_avg_cpu" "$energy_avg_gpu" "$energy_avg_total" \
+    "$energy_exit"
 }
 
 ensure_binaries() {
@@ -190,6 +318,16 @@ main() {
 
   declare -A wall_results
   declare -A cpu_results
+  declare -A energy_used_results
+  declare -A energy_duration_results
+  declare -A energy_cpu_results
+  declare -A energy_gpu_results
+  declare -A energy_total_results
+  declare -A energy_kwh_results
+  declare -A energy_avg_cpu_results
+  declare -A energy_avg_gpu_results
+  declare -A energy_avg_total_results
+  declare -A energy_exit_results
 
   for size_mb in "${SIZES_MB[@]}"; do
     generate_fasta "$size_mb"
@@ -198,16 +336,48 @@ main() {
     local rust_out="${OUTPUT_DIR}/rust_${size_mb}mb.tsv"
     echo "Running Rust PERF for ${size_mb}MB..."
     local rust_t
+    local wall cpu energy_used energy_duration energy_cpu energy_gpu
+    local energy_total energy_kwh energy_avg_cpu energy_avg_gpu energy_avg_total energy_exit
     rust_t=$(run_rust "$input" "$rust_out")
-    wall_results["${size_mb},perf-rust"]=${rust_t% *}
-    cpu_results["${size_mb},perf-rust"]=${rust_t#* }
+    IFS=$'\t' read -r \
+      wall cpu energy_used energy_duration energy_cpu energy_gpu \
+      energy_total energy_kwh energy_avg_cpu energy_avg_gpu energy_avg_total \
+      energy_exit <<<"$rust_t"
+    wall_results["${size_mb},perf-rust"]=$wall
+    cpu_results["${size_mb},perf-rust"]=$cpu
+    energy_used_results["${size_mb},perf-rust"]=$energy_used
+    energy_duration_results["${size_mb},perf-rust"]=$energy_duration
+    energy_cpu_results["${size_mb},perf-rust"]=$energy_cpu
+    energy_gpu_results["${size_mb},perf-rust"]=$energy_gpu
+    energy_total_results["${size_mb},perf-rust"]=$energy_total
+    energy_kwh_results["${size_mb},perf-rust"]=$energy_kwh
+    energy_avg_cpu_results["${size_mb},perf-rust"]=$energy_avg_cpu
+    energy_avg_gpu_results["${size_mb},perf-rust"]=$energy_avg_gpu
+    energy_avg_total_results["${size_mb},perf-rust"]=$energy_avg_total
+    energy_exit_results["${size_mb},perf-rust"]=$energy_exit
 
     local py_out="${OUTPUT_DIR}/cpython_${size_mb}mb.tsv"
     echo "Running CPython PERF for ${size_mb}MB..."
     local py_t
+    local py_wall py_cpu py_energy_used py_energy_duration py_energy_cpu py_energy_gpu
+    local py_energy_total py_energy_kwh py_energy_avg_cpu py_energy_avg_gpu py_energy_avg_total py_energy_exit
     py_t=$(run_cpython "$input" "$py_out")
-    wall_results["${size_mb},perf-cpython"]=${py_t% *}
-    cpu_results["${size_mb},perf-cpython"]=${py_t#* }
+    IFS=$'\t' read -r \
+      py_wall py_cpu py_energy_used py_energy_duration py_energy_cpu py_energy_gpu \
+      py_energy_total py_energy_kwh py_energy_avg_cpu py_energy_avg_gpu py_energy_avg_total \
+      py_energy_exit <<<"$py_t"
+    wall_results["${size_mb},perf-cpython"]=$py_wall
+    cpu_results["${size_mb},perf-cpython"]=$py_cpu
+    energy_used_results["${size_mb},perf-cpython"]=$py_energy_used
+    energy_duration_results["${size_mb},perf-cpython"]=$py_energy_duration
+    energy_cpu_results["${size_mb},perf-cpython"]=$py_energy_cpu
+    energy_gpu_results["${size_mb},perf-cpython"]=$py_energy_gpu
+    energy_total_results["${size_mb},perf-cpython"]=$py_energy_total
+    energy_kwh_results["${size_mb},perf-cpython"]=$py_energy_kwh
+    energy_avg_cpu_results["${size_mb},perf-cpython"]=$py_energy_avg_cpu
+    energy_avg_gpu_results["${size_mb},perf-cpython"]=$py_energy_avg_gpu
+    energy_avg_total_results["${size_mb},perf-cpython"]=$py_energy_avg_total
+    energy_exit_results["${size_mb},perf-cpython"]=$py_energy_exit
 
     validate_outputs "$py_out" "$rust_out" "Rust vs CPython (${size_mb}MB)"
 
@@ -215,9 +385,25 @@ main() {
       local pypy_out="${OUTPUT_DIR}/pypy_${size_mb}mb.tsv"
       echo "Running PyPy PERF for ${size_mb}MB..."
       local pypy_t
+      local pypy_wall pypy_cpu pypy_energy_used pypy_energy_duration pypy_energy_cpu pypy_energy_gpu
+      local pypy_energy_total pypy_energy_kwh pypy_energy_avg_cpu pypy_energy_avg_gpu pypy_energy_avg_total pypy_energy_exit
       pypy_t=$(run_pypy "$input" "$pypy_out")
-      wall_results["${size_mb},perf-pypy"]=${pypy_t% *}
-      cpu_results["${size_mb},perf-pypy"]=${pypy_t#* }
+      IFS=$'\t' read -r \
+        pypy_wall pypy_cpu pypy_energy_used pypy_energy_duration pypy_energy_cpu pypy_energy_gpu \
+        pypy_energy_total pypy_energy_kwh pypy_energy_avg_cpu pypy_energy_avg_gpu pypy_energy_avg_total \
+        pypy_energy_exit <<<"$pypy_t"
+      wall_results["${size_mb},perf-pypy"]=$pypy_wall
+      cpu_results["${size_mb},perf-pypy"]=$pypy_cpu
+      energy_used_results["${size_mb},perf-pypy"]=$pypy_energy_used
+      energy_duration_results["${size_mb},perf-pypy"]=$pypy_energy_duration
+      energy_cpu_results["${size_mb},perf-pypy"]=$pypy_energy_cpu
+      energy_gpu_results["${size_mb},perf-pypy"]=$pypy_energy_gpu
+      energy_total_results["${size_mb},perf-pypy"]=$pypy_energy_total
+      energy_kwh_results["${size_mb},perf-pypy"]=$pypy_energy_kwh
+      energy_avg_cpu_results["${size_mb},perf-pypy"]=$pypy_energy_avg_cpu
+      energy_avg_gpu_results["${size_mb},perf-pypy"]=$pypy_energy_avg_gpu
+      energy_avg_total_results["${size_mb},perf-pypy"]=$pypy_energy_avg_total
+      energy_exit_results["${size_mb},perf-pypy"]=$pypy_energy_exit
 
       validate_outputs "$py_out" "$pypy_out" "PyPy vs CPython (${size_mb}MB)"
     fi
@@ -225,8 +411,12 @@ main() {
 
   echo
   echo "PERF benchmark results (seconds):"
-  printf "%-10s %-15s %10s %10s %12s\n" "Size(MB)" "Program" "Wall(s)" "CPU(s)" "CPU/Wall"
-  printf "%-10s %-15s %10s %10s %12s\n" "--------" "-------" "-------" "------" "--------"
+  printf "%-10s %-15s %10s %10s %12s %8s %10s %12s %12s\n" \
+    "Size(MB)" "Program" "Wall(s)" "CPU(s)" "CPU/Wall" \
+    "E-Run" "E-Dur(s)" "E-Total(J)" "E-AvgW"
+  printf "%-10s %-15s %10s %10s %12s %8s %10s %12s %12s\n" \
+    "--------" "-------" "-------" "------" "--------" \
+    "-----" "--------" "----------" "------"
 
   for size_mb in "${SIZES_MB[@]}"; do
     for program in "${PROGRAMS[@]}"; do
@@ -234,9 +424,21 @@ main() {
       if [[ -n "${wall_results[$key]:-}" ]]; then
         local wall="${wall_results[$key]}"
         local cpu="${cpu_results[$key]}"
+        local energy_duration="${energy_duration_results[$key]:-null}"
+        local energy_total="${energy_total_results[$key]:-null}"
+        local energy_avg_total="${energy_avg_total_results[$key]:-null}"
+        local energy_used="${energy_used_results[$key]:-0}"
+        local energy_used_fmt
+        local energy_duration_fmt energy_total_fmt energy_avg_total_fmt
         local ratio
         ratio=$(awk -v w="$wall" -v c="$cpu" 'BEGIN { if (w > 0) printf "%.1fx", c/w; else print "N/A" }')
-        printf "%-10s %-15s %10s %10s %12s\n" "$size_mb" "$program" "$wall" "$cpu" "$ratio"
+        energy_used_fmt=$(json_bool "$energy_used")
+        energy_duration_fmt=$(fmt_optional_number "$energy_duration" 3)
+        energy_total_fmt=$(fmt_optional_number "$energy_total" 3)
+        energy_avg_total_fmt=$(fmt_optional_number "$energy_avg_total" 3)
+        printf "%-10s %-15s %10s %10s %12s %8s %10s %12s %12s\n" \
+          "$size_mb" "$program" "$wall" "$cpu" "$ratio" \
+          "$energy_used_fmt" "$energy_duration_fmt" "$energy_total_fmt" "$energy_avg_total_fmt"
       fi
     done
   done
@@ -249,7 +451,14 @@ main() {
     echo '  "metadata": {'
     echo "    \"date\": \"$(date -Iseconds)\","
     echo "    \"hostname\": \"$(hostname)\","
-    echo "    \"uname\": \"$(uname -srm)\""
+    echo "    \"uname\": \"$(uname -srm)\","
+    echo "    \"energy_run_available\": $(json_bool "$ENERGY_RUN_AVAILABLE"),"
+    if [[ "$ENERGY_RUN_AVAILABLE" -eq 1 ]]; then
+      echo "    \"energy_run_path\": \"$(json_escape "$ENERGY_RUN_BIN")\","
+    else
+      echo '    "energy_run_path": null,'
+    fi
+    echo "    \"energy_run_disable_gpu\": $(json_bool "$ENERGY_RUN_DISABLE_GPU")"
     echo '  },'
     echo '  "programs": ['
     local first_prog=1
@@ -269,9 +478,19 @@ main() {
           if [[ $first_entry -eq 0 ]]; then echo ','; fi
           local wall="${wall_results[$key]}"
           local cpu="${cpu_results[$key]}"
+          local energy_used="${energy_used_results[$key]:-0}"
+          local energy_duration="${energy_duration_results[$key]:-null}"
+          local energy_cpu="${energy_cpu_results[$key]:-null}"
+          local energy_gpu="${energy_gpu_results[$key]:-null}"
+          local energy_total="${energy_total_results[$key]:-null}"
+          local energy_kwh="${energy_kwh_results[$key]:-null}"
+          local energy_avg_cpu="${energy_avg_cpu_results[$key]:-null}"
+          local energy_avg_gpu="${energy_avg_gpu_results[$key]:-null}"
+          local energy_avg_total="${energy_avg_total_results[$key]:-null}"
+          local energy_exit="${energy_exit_results[$key]:-null}"
           local ratio
           ratio=$(awk -v w="$wall" -v c="$cpu" 'BEGIN { if (w > 0) printf "%.1f", c/w; else print "0" }')
-          echo -n "    {\"size_mb\": ${size_mb}, \"program\": \"${program}\", \"wall_s\": ${wall}, \"cpu_s\": ${cpu}, \"cpu_wall_ratio\": ${ratio}}"
+          echo -n "    {\"size_mb\": ${size_mb}, \"program\": \"${program}\", \"wall_s\": ${wall}, \"cpu_s\": ${cpu}, \"cpu_wall_ratio\": ${ratio}, \"execution\": {\"energy_run_used\": $(json_bool "$energy_used"), \"energy\": {\"duration_s\": ${energy_duration}, \"cpu_energy_j\": ${energy_cpu}, \"gpu_energy_j\": ${energy_gpu}, \"total_energy_j\": ${energy_total}, \"total_energy_kwh\": ${energy_kwh}, \"avg_cpu_power_w\": ${energy_avg_cpu}, \"avg_gpu_power_w\": ${energy_avg_gpu}, \"avg_total_power_w\": ${energy_avg_total}, \"exit_code\": ${energy_exit}}}}"
           first_entry=0
         fi
       done

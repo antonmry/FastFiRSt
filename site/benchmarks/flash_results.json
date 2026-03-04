@@ -1,9 +1,12 @@
 {
   "metadata": {
-    "date": "2026-03-03T20:55:40+01:00",
+    "date": "2026-03-04T14:36:52+01:00",
     "read_length": 150,
-    "hostname": "lima-default",
-    "uname": "Linux 6.17.0-14-generic aarch64"
+    "hostname": "gali10",
+    "uname": "Linux 6.17.6-200.fc42.x86_64 x86_64",
+    "energy_run_available": true,
+    "energy_run_path": "/home/antonmry/.cargo/bin/energy-run",
+    "energy_run_disable_gpu": true
   },
   "programs": [
     "flash-cli",
@@ -11,27 +14,27 @@
     "flash-lowercase-overhang"
   ],
   "results": [
-    {"records": 1000, "input_mb": 0.61, "program": "flash-cli", "wall_s": 0.008, "cpu_s": 0.000, "cpu_wall_ratio": 0.0},
-    {"records": 1000, "input_mb": 0.61, "program": "flash-cli-parallel", "wall_s": 0.007, "cpu_s": 0.000, "cpu_wall_ratio": 0.0},
-    {"records": 1000, "input_mb": 0.61, "program": "flash-lowercase-overhang", "wall_s": 0.011, "cpu_s": 0.000, "cpu_wall_ratio": 0.0},
-    {"records": 10000, "input_mb": 6.12, "program": "flash-cli", "wall_s": 0.032, "cpu_s": 0.020, "cpu_wall_ratio": 0.6},
-    {"records": 10000, "input_mb": 6.12, "program": "flash-cli-parallel", "wall_s": 0.028, "cpu_s": 0.030, "cpu_wall_ratio": 1.1},
-    {"records": 10000, "input_mb": 6.12, "program": "flash-lowercase-overhang", "wall_s": 0.029, "cpu_s": 0.080, "cpu_wall_ratio": 2.8},
-    {"records": 100000, "input_mb": 61.23, "program": "flash-cli", "wall_s": 0.292, "cpu_s": 0.260, "cpu_wall_ratio": 0.9},
-    {"records": 100000, "input_mb": 61.23, "program": "flash-cli-parallel", "wall_s": 0.192, "cpu_s": 0.370, "cpu_wall_ratio": 1.9},
-    {"records": 100000, "input_mb": 61.23, "program": "flash-lowercase-overhang", "wall_s": 0.207, "cpu_s": 0.780, "cpu_wall_ratio": 3.8},
-    {"records": 1000000, "input_mb": 612.26, "program": "flash-cli", "wall_s": 2.711, "cpu_s": 2.530, "cpu_wall_ratio": 0.9},
-    {"records": 1000000, "input_mb": 612.26, "program": "flash-cli-parallel", "wall_s": 1.929, "cpu_s": 3.940, "cpu_wall_ratio": 2.0},
-    {"records": 1000000, "input_mb": 612.26, "program": "flash-lowercase-overhang", "wall_s": 1.867, "cpu_s": 7.790, "cpu_wall_ratio": 4.2},
-    {"records": 10000000, "input_mb": 6122.59, "program": "flash-cli", "wall_s": 27.604, "cpu_s": 25.870, "cpu_wall_ratio": 0.9},
-    {"records": 10000000, "input_mb": 6122.59, "program": "flash-cli-parallel", "wall_s": 19.074, "cpu_s": 39.480, "cpu_wall_ratio": 2.1},
-    {"records": 10000000, "input_mb": 6122.59, "program": "flash-lowercase-overhang", "wall_s": 18.526, "cpu_s": 77.670, "cpu_wall_ratio": 4.2}
+    {"records": 1000, "input_mb": 0.61, "program": "flash-cli", "wall_s": 0.110, "cpu_s": 0.010, "cpu_wall_ratio": 0.1, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.100103498, "cpu_energy_j": 13.754124, "gpu_energy_j": null, "total_energy_j": 13.754124, "total_energy_kwh": 3.82059e-06, "avg_cpu_power_w": 137.39903474701754, "avg_gpu_power_w": null, "avg_total_power_w": 137.39903474701754, "exit_code": 0}}},
+    {"records": 1000, "input_mb": 0.61, "program": "flash-cli-parallel", "wall_s": 0.100, "cpu_s": 0.010, "cpu_wall_ratio": 0.1, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.100108761, "cpu_energy_j": 15.412987, "gpu_energy_j": null, "total_energy_j": 15.412987, "total_energy_kwh": 4.281385277777778e-06, "avg_cpu_power_w": 153.9624189335437, "avg_gpu_power_w": null, "avg_total_power_w": 153.9624189335437, "exit_code": 0}}},
+    {"records": 1000, "input_mb": 0.61, "program": "flash-lowercase-overhang", "wall_s": 0.100, "cpu_s": 0.020, "cpu_wall_ratio": 0.2, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.100139646, "cpu_energy_j": 15.265038, "gpu_energy_j": null, "total_energy_j": 15.265038, "total_energy_kwh": 4.2402883333333335e-06, "avg_cpu_power_w": 152.43750711880887, "avg_gpu_power_w": null, "avg_total_power_w": 152.43750711880887, "exit_code": 0}}},
+    {"records": 10000, "input_mb": 6.12, "program": "flash-cli", "wall_s": 0.100, "cpu_s": 0.060, "cpu_wall_ratio": 0.6, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.100178879, "cpu_energy_j": 17.288463, "gpu_energy_j": null, "total_energy_j": 17.288463, "total_energy_kwh": 4.8023508333333335e-06, "avg_cpu_power_w": 172.57592790592116, "avg_gpu_power_w": null, "avg_total_power_w": 172.57592790592116, "exit_code": 0}}},
+    {"records": 10000, "input_mb": 6.12, "program": "flash-cli-parallel", "wall_s": 0.100, "cpu_s": 0.090, "cpu_wall_ratio": 0.9, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.100091615, "cpu_energy_j": 18.984818, "gpu_energy_j": null, "total_energy_j": 18.984818, "total_energy_kwh": 5.273560555555555e-06, "avg_cpu_power_w": 189.67440978947138, "avg_gpu_power_w": null, "avg_total_power_w": 189.67440978947138, "exit_code": 0}}},
+    {"records": 10000, "input_mb": 6.12, "program": "flash-lowercase-overhang", "wall_s": 0.100, "cpu_s": 0.160, "cpu_wall_ratio": 1.6, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.100101205, "cpu_energy_j": 18.277117, "gpu_energy_j": null, "total_energy_j": 18.277117, "total_energy_kwh": 5.076976944444444e-06, "avg_cpu_power_w": 182.5863834506288, "avg_gpu_power_w": null, "avg_total_power_w": 182.5863834506288, "exit_code": 0}}},
+    {"records": 100000, "input_mb": 61.23, "program": "flash-cli", "wall_s": 0.600, "cpu_s": 0.530, "cpu_wall_ratio": 0.9, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.60048303, "cpu_energy_j": 109.852742, "gpu_energy_j": null, "total_energy_j": 109.852742, "total_energy_kwh": 3.051465055555556e-05, "avg_cpu_power_w": 182.9406269815818, "avg_gpu_power_w": null, "avg_total_power_w": 182.9406269815818, "exit_code": 0}}},
+    {"records": 100000, "input_mb": 61.23, "program": "flash-cli-parallel", "wall_s": 0.400, "cpu_s": 0.800, "cpu_wall_ratio": 2.0, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.400340166, "cpu_energy_j": 101.715991, "gpu_energy_j": null, "total_energy_j": 101.715991, "total_energy_kwh": 2.8254441944444444e-05, "avg_cpu_power_w": 254.07390923647668, "avg_gpu_power_w": null, "avg_total_power_w": 254.07390923647668, "exit_code": 0}}},
+    {"records": 100000, "input_mb": 61.23, "program": "flash-lowercase-overhang", "wall_s": 0.200, "cpu_s": 0.760, "cpu_wall_ratio": 3.8, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.200213732, "cpu_energy_j": 52.338548, "gpu_energy_j": null, "total_energy_j": 52.338548, "total_energy_kwh": 1.4538485555555556e-05, "avg_cpu_power_w": 261.4133779794885, "avg_gpu_power_w": null, "avg_total_power_w": 261.4133779794885, "exit_code": 0}}},
+    {"records": 1000000, "input_mb": 612.26, "program": "flash-cli", "wall_s": 5.310, "cpu_s": 5.210, "cpu_wall_ratio": 1.0, "execution": {"energy_run_used": true, "energy": {"duration_s": 5.304115456, "cpu_energy_j": 1038.436063, "gpu_energy_j": null, "total_energy_j": 1038.436063, "total_energy_kwh": 0.00028845446194444445, "avg_cpu_power_w": 195.7793097858238, "avg_gpu_power_w": null, "avg_total_power_w": 195.7793097858238, "exit_code": 0}}},
+    {"records": 1000000, "input_mb": 612.26, "program": "flash-cli-parallel", "wall_s": 3.210, "cpu_s": 7.310, "cpu_wall_ratio": 2.3, "execution": {"energy_run_used": true, "energy": {"duration_s": 3.203019458, "cpu_energy_j": 913.342803, "gpu_energy_j": null, "total_energy_j": 913.342803, "total_energy_kwh": 0.00025370633416666664, "avg_cpu_power_w": 285.1505633906767, "avg_gpu_power_w": null, "avg_total_power_w": 285.1505633906767, "exit_code": 0}}},
+    {"records": 1000000, "input_mb": 612.26, "program": "flash-lowercase-overhang", "wall_s": 0.600, "cpu_s": 5.900, "cpu_wall_ratio": 9.8, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.600594252, "cpu_energy_j": 312.681211, "gpu_energy_j": null, "total_energy_j": 312.681211, "total_energy_kwh": 8.685589194444445e-05, "avg_cpu_power_w": 520.6197194840952, "avg_gpu_power_w": null, "avg_total_power_w": 520.6197194840952, "exit_code": 0}}},
+    {"records": 10000000, "input_mb": 6122.59, "program": "flash-cli", "wall_s": 52.350, "cpu_s": 52.160, "cpu_wall_ratio": 1.0, "execution": {"energy_run_used": true, "energy": {"duration_s": 52.344652897, "cpu_energy_j": 10506.873979, "gpu_energy_j": null, "total_energy_j": 10506.873979, "total_energy_kwh": 0.002918576105277778, "avg_cpu_power_w": 200.72487632451515, "avg_gpu_power_w": null, "avg_total_power_w": 200.72487632451515, "exit_code": 0}}},
+    {"records": 10000000, "input_mb": 6122.59, "program": "flash-cli-parallel", "wall_s": 32.030, "cpu_s": 74.120, "cpu_wall_ratio": 2.3, "execution": {"energy_run_used": true, "energy": {"duration_s": 32.029687915, "cpu_energy_j": 9424.178885, "gpu_energy_j": null, "total_energy_j": 9424.178885, "total_energy_kwh": 0.0026178274680555553, "avg_cpu_power_w": 294.23261662772904, "avg_gpu_power_w": null, "avg_total_power_w": 294.23261662772904, "exit_code": 0}}},
+    {"records": 10000000, "input_mb": 6122.59, "program": "flash-lowercase-overhang", "wall_s": 4.910, "cpu_s": 59.330, "cpu_wall_ratio": 12.1, "execution": {"energy_run_used": true, "energy": {"duration_s": 4.906815252, "cpu_energy_j": 2987.13322, "gpu_energy_j": null, "total_energy_j": 2987.13322, "total_energy_kwh": 0.0008297592277777779, "avg_cpu_power_w": 608.7723027237382, "avg_gpu_power_w": null, "avg_total_power_w": 608.7723027237382, "exit_code": 0}}}
   ],
   "warnings": [
-    "Record order mismatch for 1000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000000617.1 (input index 616) appears after @SEQ0000001000.1 (index 999) at output record 649",
-    "Record order mismatch for 10000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000001585.1 (input index 1584) appears after @SEQ0000001936.1 (index 1935) at output record 1849",
-    "Record order mismatch for 100000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000000001.1 (input index 0) appears after @SEQ0000000176.1 (index 175) at output record 89",
-    "Record order mismatch for 1000000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000001057.1 (input index 1056) appears after @SEQ0000001232.1 (index 1231) at output record 1145",
-    "Record order mismatch for 10000000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000001585.1 (input index 1584) appears after @SEQ0000001760.1 (index 1759) at output record 1673"
+    "Record order mismatch for 1000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000000701.1 (input index 700) appears after @SEQ0000001000.1 (index 999) at output record 581",
+    "Record order mismatch for 10000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000000421.1 (input index 420) appears after @SEQ0000000700.1 (index 699) at output record 561",
+    "Record order mismatch for 100000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000000841.1 (input index 840) appears after @SEQ0000001120.1 (index 1119) at output record 981",
+    "Record order mismatch for 1000000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000003081.1 (input index 3080) appears after @SEQ0000003360.1 (index 3359) at output record 3221",
+    "Record order mismatch for 10000000 (flash.extendedFrags.fastq, flash-lowercase-overhang): out-of-order tag @SEQ0000001261.1 (input index 1260) appears after @SEQ0000001540.1 (index 1539) at output record 1401"
   ]
 }

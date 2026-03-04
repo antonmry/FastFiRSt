@@ -1,8 +1,11 @@
 {
   "metadata": {
-    "date": "2026-03-03T21:20:01+01:00",
-    "hostname": "lima-default",
-    "uname": "Linux 6.17.0-14-generic aarch64"
+    "date": "2026-03-04T14:43:14+01:00",
+    "hostname": "gali10",
+    "uname": "Linux 6.17.6-200.fc42.x86_64 x86_64",
+    "energy_run_available": true,
+    "energy_run_path": "/home/antonmry/.cargo/bin/energy-run",
+    "energy_run_disable_gpu": true
   },
   "programs": [
     "perf-rust",
@@ -10,17 +13,17 @@
     "perf-pypy"
   ],
   "results": [
-    {"size_mb": 1, "program": "perf-rust", "wall_s": 0.010, "cpu_s": 0.020, "cpu_wall_ratio": 2.0},
-    {"size_mb": 1, "program": "perf-cpython", "wall_s": 0.272, "cpu_s": 1.510, "cpu_wall_ratio": 5.6},
-    {"size_mb": 1, "program": "perf-pypy", "wall_s": 0.355, "cpu_s": 1.600, "cpu_wall_ratio": 4.5},
-    {"size_mb": 10, "program": "perf-rust", "wall_s": 0.031, "cpu_s": 0.200, "cpu_wall_ratio": 6.5},
-    {"size_mb": 10, "program": "perf-cpython", "wall_s": 0.961, "cpu_s": 2.180, "cpu_wall_ratio": 2.3},
-    {"size_mb": 10, "program": "perf-pypy", "wall_s": 0.747, "cpu_s": 1.960, "cpu_wall_ratio": 2.6},
-    {"size_mb": 100, "program": "perf-rust", "wall_s": 0.172, "cpu_s": 1.960, "cpu_wall_ratio": 11.4},
-    {"size_mb": 100, "program": "perf-cpython", "wall_s": 8.002, "cpu_s": 8.980, "cpu_wall_ratio": 1.1},
-    {"size_mb": 100, "program": "perf-pypy", "wall_s": 4.379, "cpu_s": 5.350, "cpu_wall_ratio": 1.2},
-    {"size_mb": 500, "program": "perf-rust", "wall_s": 0.787, "cpu_s": 9.850, "cpu_wall_ratio": 12.5},
-    {"size_mb": 500, "program": "perf-cpython", "wall_s": 38.856, "cpu_s": 38.760, "cpu_wall_ratio": 1.0},
-    {"size_mb": 500, "program": "perf-pypy", "wall_s": 20.184, "cpu_s": 20.090, "cpu_wall_ratio": 1.0}
+    {"size_mb": 1, "program": "perf-rust", "wall_s": 0.100, "cpu_s": 0.090, "cpu_wall_ratio": 0.9, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.100235347, "cpu_energy_j": 17.092235, "gpu_energy_j": null, "total_energy_j": 17.092235, "total_energy_kwh": 4.747843055555555e-06, "avg_cpu_power_w": 170.52103386243576, "avg_gpu_power_w": null, "avg_total_power_w": 170.52103386243576, "exit_code": 0}}},
+    {"size_mb": 1, "program": "perf-cpython", "wall_s": 0.700, "cpu_s": 2.440, "cpu_wall_ratio": 3.5, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.700817075, "cpu_energy_j": 165.478276, "gpu_energy_j": null, "total_energy_j": 165.478276, "total_energy_kwh": 4.596618777777778e-05, "avg_cpu_power_w": 236.12192382726974, "avg_gpu_power_w": null, "avg_total_power_w": 236.12192382726974, "exit_code": 0}}},
+    {"size_mb": 1, "program": "perf-pypy", "wall_s": 0.800, "cpu_s": 2.580, "cpu_wall_ratio": 3.2, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.801210182, "cpu_energy_j": 178.740692, "gpu_energy_j": null, "total_energy_j": 178.740692, "total_energy_kwh": 4.9650192222222224e-05, "avg_cpu_power_w": 223.08839305289806, "avg_gpu_power_w": null, "avg_total_power_w": 223.08839305289806, "exit_code": 0}}},
+    {"size_mb": 10, "program": "perf-rust", "wall_s": 0.100, "cpu_s": 0.670, "cpu_wall_ratio": 6.7, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.10011605, "cpu_energy_j": 33.032814, "gpu_energy_j": null, "total_energy_j": 33.032814, "total_energy_kwh": 9.175781666666667e-06, "avg_cpu_power_w": 329.945238550662, "avg_gpu_power_w": null, "avg_total_power_w": 329.945238550662, "exit_code": 0}}},
+    {"size_mb": 10, "program": "perf-cpython", "wall_s": 2.710, "cpu_s": 4.510, "cpu_wall_ratio": 1.7, "execution": {"energy_run_used": true, "energy": {"duration_s": 2.702605367, "cpu_energy_j": 570.491225, "gpu_energy_j": null, "total_energy_j": 570.491225, "total_energy_kwh": 0.0001584697847222222, "avg_cpu_power_w": 211.08935546637653, "avg_gpu_power_w": null, "avg_total_power_w": 211.08935546637653, "exit_code": 0}}},
+    {"size_mb": 10, "program": "perf-pypy", "wall_s": 1.500, "cpu_s": 3.350, "cpu_wall_ratio": 2.2, "execution": {"energy_run_used": true, "energy": {"duration_s": 1.5015088680000002, "cpu_energy_j": 319.320896, "gpu_energy_j": null, "total_energy_j": 319.320896, "total_energy_kwh": 8.87002488888889e-05, "avg_cpu_power_w": 212.66667337458574, "avg_gpu_power_w": null, "avg_total_power_w": 212.66667337458574, "exit_code": 0}}},
+    {"size_mb": 100, "program": "perf-rust", "wall_s": 0.510, "cpu_s": 6.380, "cpu_wall_ratio": 12.5, "execution": {"energy_run_used": true, "energy": {"duration_s": 0.501074364, "cpu_energy_j": 259.486523, "gpu_energy_j": null, "total_energy_j": 259.486523, "total_energy_kwh": 7.207958972222221e-05, "avg_cpu_power_w": 517.8603050624238, "avg_gpu_power_w": null, "avg_total_power_w": 517.8603050624238, "exit_code": 0}}},
+    {"size_mb": 100, "program": "perf-cpython", "wall_s": 23.130, "cpu_s": 24.970, "cpu_wall_ratio": 1.1, "execution": {"energy_run_used": true, "energy": {"duration_s": 23.121939863, "cpu_energy_j": 5418.284167, "gpu_energy_j": null, "total_energy_j": 5418.284167, "total_energy_kwh": 0.0015050789352777777, "avg_cpu_power_w": 234.3351898285317, "avg_gpu_power_w": null, "avg_total_power_w": 234.3351898285317, "exit_code": 0}}},
+    {"size_mb": 100, "program": "perf-pypy", "wall_s": 8.810, "cpu_s": 10.510, "cpu_wall_ratio": 1.2, "execution": {"energy_run_used": true, "energy": {"duration_s": 8.807647119, "cpu_energy_j": 1927.521612, "gpu_energy_j": null, "total_energy_j": 1927.521612, "total_energy_kwh": 0.00053542267, "avg_cpu_power_w": 218.8463713358723, "avg_gpu_power_w": null, "avg_total_power_w": 218.8463713358723, "exit_code": 0}}},
+    {"size_mb": 500, "program": "perf-rust", "wall_s": 1.910, "cpu_s": 31.430, "cpu_wall_ratio": 16.5, "execution": {"energy_run_used": true, "energy": {"duration_s": 1.907860875, "cpu_energy_j": 1250.344945, "gpu_energy_j": null, "total_energy_j": 1250.344945, "total_energy_kwh": 0.0003473180402777778, "avg_cpu_power_w": 655.3648441477684, "avg_gpu_power_w": null, "avg_total_power_w": 655.3648441477684, "exit_code": 0}}},
+    {"size_mb": 500, "program": "perf-cpython", "wall_s": 114.490, "cpu_s": 115.970, "cpu_wall_ratio": 1.0, "execution": {"energy_run_used": true, "energy": {"duration_s": 114.488568207, "cpu_energy_j": 24917.226986, "gpu_energy_j": null, "total_energy_j": 24917.226986, "total_energy_kwh": 0.006921451940555556, "avg_cpu_power_w": 217.63943227020394, "avg_gpu_power_w": null, "avg_total_power_w": 217.63943227020394, "exit_code": 0}}},
+    {"size_mb": 500, "program": "perf-pypy", "wall_s": 40.540, "cpu_s": 42.160, "cpu_wall_ratio": 1.0, "execution": {"energy_run_used": true, "energy": {"duration_s": 40.537347579, "cpu_energy_j": 9870.524719, "gpu_energy_j": null, "total_energy_j": 9870.524719, "total_energy_kwh": 0.0027418124219444444, "avg_cpu_power_w": 243.49212043940767, "avg_gpu_power_w": null, "avg_total_power_w": 243.49212043940767, "exit_code": 0}}}
   ]
 }

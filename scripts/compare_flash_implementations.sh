@@ -19,6 +19,13 @@ FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
 FLASH_C_BIN="${FLASH_C_BIN:-${ROOT_DIR}/bin/flash-lowercase-overhang}"
 
 PROGRAMS=("flash-cli" "flash-cli-parallel" "flash-lowercase-overhang")
+ENERGY_RUN_BIN=""
+ENERGY_RUN_AVAILABLE=0
+ENERGY_RUN_DISABLE_GPU="${ENERGY_RUN_DISABLE_GPU:-1}"
+if command -v energy-run >/dev/null 2>&1; then
+  ENERGY_RUN_BIN="$(command -v energy-run)"
+  ENERGY_RUN_AVAILABLE=1
+fi
 
 ensure_binaries() {
   local need_rust=0
@@ -50,22 +57,142 @@ elapsed_seconds() {
   awk -v start="$start_ns" -v end="$end_ns" 'BEGIN { printf "%.3f", (end-start)/1000000000 }'
 }
 
-# Run a command and return "wall_seconds cpu_seconds" (wall via date, CPU via /usr/bin/time)
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_bool() {
+  if [[ "$1" == "1" ]]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+fmt_optional_number() {
+  local value=$1
+  local decimals=$2
+  if [[ "$value" == "null" || -z "$value" ]]; then
+    printf 'N/A'
+  else
+    awk -v v="$value" -v d="$decimals" 'BEGIN { printf "%.*f", d, v }'
+  fi
+}
+
+# Run a command and emit a tab-separated row:
+# wall_s cpu_s energy_used energy_duration_s energy_cpu_j energy_gpu_j
+# energy_total_j energy_total_kwh energy_avg_cpu_w energy_avg_gpu_w
+# energy_avg_total_w energy_exit_code
 # Usage: run_timed stdout_log stderr_log cmd [args...]
 run_timed() {
   local stdout_log=$1
   local stderr_log=$2
   shift 2
+
   local time_file
   time_file=$(mktemp "${OUTPUT_DIR}/time_XXXXXX")
-  local start end wall_s cpu_s
-  start=$(now_ns)
-  /usr/bin/time -o "$time_file" -f '%U %S' "$@" >"$stdout_log" 2>"$stderr_log"
-  end=$(now_ns)
-  wall_s=$(elapsed_seconds "$start" "$end")
-  cpu_s=$(awk '{ printf "%.3f", $1 + $2 }' "$time_file")
-  rm -f "$time_file"
-  echo "${wall_s} ${cpu_s}"
+  local energy_file
+  energy_file=$(mktemp "${OUTPUT_DIR}/energy_XXXXXX.json")
+
+  local wall_s cpu_s cmd_status
+  local energy_used=0
+  local energy_duration="null"
+  local energy_cpu="null"
+  local energy_gpu="null"
+  local energy_total="null"
+  local energy_kwh="null"
+  local energy_avg_cpu="null"
+  local energy_avg_gpu="null"
+  local energy_avg_total="null"
+  local energy_exit="null"
+
+  if [[ "$ENERGY_RUN_AVAILABLE" -eq 1 ]]; then
+    local -a energy_args
+    energy_args=(--output json)
+    if [[ "${ENERGY_RUN_DISABLE_GPU}" == "1" ]]; then
+      energy_args+=(--no-gpu)
+    fi
+
+    set +e
+    /usr/bin/time -o "$time_file" -f '%e %U %S' \
+      "$ENERGY_RUN_BIN" "${energy_args[@]}" -- \
+      bash -c 'stdout_log=$1; stderr_log=$2; shift 2; exec "$@" >"$stdout_log" 2>"$stderr_log"' _ \
+      "$stdout_log" "$stderr_log" "$@" >"$energy_file"
+    cmd_status=$?
+    set -e
+
+    if [[ "$cmd_status" -ne 0 && ! -s "$energy_file" ]]; then
+      echo "Warning: energy-run backend unavailable; retrying with --no-cpu --no-gpu." >&2
+      set +e
+      /usr/bin/time -o "$time_file" -f '%e %U %S' \
+        "$ENERGY_RUN_BIN" --output json --no-cpu --no-gpu -- \
+        bash -c 'stdout_log=$1; stderr_log=$2; shift 2; exec "$@" >"$stdout_log" 2>"$stderr_log"' _ \
+        "$stdout_log" "$stderr_log" "$@" >"$energy_file"
+      cmd_status=$?
+      set -e
+    fi
+
+    if [[ -s "$energy_file" ]]; then
+      energy_used=1
+      local parsed_energy
+      parsed_energy=$(python3 - "$energy_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+def to_field(value):
+    if value is None:
+        return "null"
+    return str(value)
+
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+keys = [
+    "duration_s",
+    "cpu_energy_j",
+    "gpu_energy_j",
+    "total_energy_j",
+    "total_energy_kwh",
+    "avg_cpu_power_w",
+    "avg_gpu_power_w",
+    "avg_total_power_w",
+    "exit_code",
+]
+print("\t".join(to_field(data.get(key)) for key in keys))
+PY
+      )
+      IFS=$'\t' read -r \
+        energy_duration energy_cpu energy_gpu energy_total energy_kwh \
+        energy_avg_cpu energy_avg_gpu energy_avg_total energy_exit <<<"$parsed_energy"
+    elif [[ "$cmd_status" -eq 0 ]]; then
+      # Fallback path in case energy-run exits without writing JSON.
+      set +e
+      /usr/bin/time -o "$time_file" -f '%e %U %S' "$@" >"$stdout_log" 2>"$stderr_log"
+      cmd_status=$?
+      set -e
+    fi
+  else
+    set +e
+    /usr/bin/time -o "$time_file" -f '%e %U %S' "$@" >"$stdout_log" 2>"$stderr_log"
+    cmd_status=$?
+    set -e
+  fi
+
+  wall_s=$(awk '{ printf "%.3f", $1 }' "$time_file")
+  cpu_s=$(awk '{ printf "%.3f", $2 + $3 }' "$time_file")
+  rm -f "$time_file" "$energy_file"
+
+  if [[ "$cmd_status" -ne 0 ]]; then
+    echo "Command failed with exit code ${cmd_status}: $*" >&2
+    return "$cmd_status"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$wall_s" "$cpu_s" "$energy_used" "$energy_duration" "$energy_cpu" "$energy_gpu" \
+    "$energy_total" "$energy_kwh" "$energy_avg_cpu" "$energy_avg_gpu" "$energy_avg_total" \
+    "$energy_exit"
 }
 
 generate_inputs() {
@@ -353,6 +480,16 @@ main() {
   declare -A wall_results
   declare -A cpu_results
   declare -A input_sizes
+  declare -A energy_used_results
+  declare -A energy_duration_results
+  declare -A energy_cpu_results
+  declare -A energy_gpu_results
+  declare -A energy_total_results
+  declare -A energy_kwh_results
+  declare -A energy_avg_cpu_results
+  declare -A energy_avg_gpu_results
+  declare -A energy_avg_total_results
+  declare -A energy_exit_results
 
   for count in "${COUNTS[@]}"; do
     generate_inputs "$count"
@@ -372,21 +509,69 @@ PY
 
     echo "Running flash-cli for ${count} records..."
     local cli_timing
+    local wall cpu energy_used energy_duration energy_cpu energy_gpu
+    local energy_total energy_kwh energy_avg_cpu energy_avg_gpu energy_avg_total energy_exit
     cli_timing=$(run_flash_cli "$count" "$r1" "$r2")
-    wall_results["${count},flash-cli"]=${cli_timing% *}
-    cpu_results["${count},flash-cli"]=${cli_timing#* }
+    IFS=$'\t' read -r \
+      wall cpu energy_used energy_duration energy_cpu energy_gpu \
+      energy_total energy_kwh energy_avg_cpu energy_avg_gpu energy_avg_total \
+      energy_exit <<<"$cli_timing"
+    wall_results["${count},flash-cli"]=$wall
+    cpu_results["${count},flash-cli"]=$cpu
+    energy_used_results["${count},flash-cli"]=$energy_used
+    energy_duration_results["${count},flash-cli"]=$energy_duration
+    energy_cpu_results["${count},flash-cli"]=$energy_cpu
+    energy_gpu_results["${count},flash-cli"]=$energy_gpu
+    energy_total_results["${count},flash-cli"]=$energy_total
+    energy_kwh_results["${count},flash-cli"]=$energy_kwh
+    energy_avg_cpu_results["${count},flash-cli"]=$energy_avg_cpu
+    energy_avg_gpu_results["${count},flash-cli"]=$energy_avg_gpu
+    energy_avg_total_results["${count},flash-cli"]=$energy_avg_total
+    energy_exit_results["${count},flash-cli"]=$energy_exit
 
     echo "Running flash-lowercase-overhang for ${count} records..."
     local c_timing
+    local c_wall c_cpu c_energy_used c_energy_duration c_energy_cpu c_energy_gpu
+    local c_energy_total c_energy_kwh c_energy_avg_cpu c_energy_avg_gpu c_energy_avg_total c_energy_exit
     c_timing=$(run_flash_c "$count" "$r1" "$r2")
-    wall_results["${count},flash-lowercase-overhang"]=${c_timing% *}
-    cpu_results["${count},flash-lowercase-overhang"]=${c_timing#* }
+    IFS=$'\t' read -r \
+      c_wall c_cpu c_energy_used c_energy_duration c_energy_cpu c_energy_gpu \
+      c_energy_total c_energy_kwh c_energy_avg_cpu c_energy_avg_gpu c_energy_avg_total \
+      c_energy_exit <<<"$c_timing"
+    wall_results["${count},flash-lowercase-overhang"]=$c_wall
+    cpu_results["${count},flash-lowercase-overhang"]=$c_cpu
+    energy_used_results["${count},flash-lowercase-overhang"]=$c_energy_used
+    energy_duration_results["${count},flash-lowercase-overhang"]=$c_energy_duration
+    energy_cpu_results["${count},flash-lowercase-overhang"]=$c_energy_cpu
+    energy_gpu_results["${count},flash-lowercase-overhang"]=$c_energy_gpu
+    energy_total_results["${count},flash-lowercase-overhang"]=$c_energy_total
+    energy_kwh_results["${count},flash-lowercase-overhang"]=$c_energy_kwh
+    energy_avg_cpu_results["${count},flash-lowercase-overhang"]=$c_energy_avg_cpu
+    energy_avg_gpu_results["${count},flash-lowercase-overhang"]=$c_energy_avg_gpu
+    energy_avg_total_results["${count},flash-lowercase-overhang"]=$c_energy_avg_total
+    energy_exit_results["${count},flash-lowercase-overhang"]=$c_energy_exit
 
     echo "Running flash-cli (parallel) for ${count} records..."
     local cli_parallel_timing
+    local p_wall p_cpu p_energy_used p_energy_duration p_energy_cpu p_energy_gpu
+    local p_energy_total p_energy_kwh p_energy_avg_cpu p_energy_avg_gpu p_energy_avg_total p_energy_exit
     cli_parallel_timing=$(run_flash_cli_parallel "$count" "$r1" "$r2")
-    wall_results["${count},flash-cli-parallel"]=${cli_parallel_timing% *}
-    cpu_results["${count},flash-cli-parallel"]=${cli_parallel_timing#* }
+    IFS=$'\t' read -r \
+      p_wall p_cpu p_energy_used p_energy_duration p_energy_cpu p_energy_gpu \
+      p_energy_total p_energy_kwh p_energy_avg_cpu p_energy_avg_gpu p_energy_avg_total \
+      p_energy_exit <<<"$cli_parallel_timing"
+    wall_results["${count},flash-cli-parallel"]=$p_wall
+    cpu_results["${count},flash-cli-parallel"]=$p_cpu
+    energy_used_results["${count},flash-cli-parallel"]=$p_energy_used
+    energy_duration_results["${count},flash-cli-parallel"]=$p_energy_duration
+    energy_cpu_results["${count},flash-cli-parallel"]=$p_energy_cpu
+    energy_gpu_results["${count},flash-cli-parallel"]=$p_energy_gpu
+    energy_total_results["${count},flash-cli-parallel"]=$p_energy_total
+    energy_kwh_results["${count},flash-cli-parallel"]=$p_energy_kwh
+    energy_avg_cpu_results["${count},flash-cli-parallel"]=$p_energy_avg_cpu
+    energy_avg_gpu_results["${count},flash-cli-parallel"]=$p_energy_avg_gpu
+    energy_avg_total_results["${count},flash-cli-parallel"]=$p_energy_avg_total
+    energy_exit_results["${count},flash-cli-parallel"]=$p_energy_exit
 
     echo "Validating outputs for ${count} records..."
     local baseline_dir="${OUTPUT_DIR}/flash-cli/${count}"
@@ -400,18 +585,33 @@ PY
 
   echo
   echo "Benchmark results (seconds):"
-  printf "%-12s %-12s %-28s %10s %10s %12s\n" "Records" "Input(MB)" "Program" "Wall(s)" "CPU(s)" "CPU/Wall"
-  printf "%-12s %-12s %-28s %10s %10s %12s\n" "-------" "----------" "-------" "-------" "------" "--------"
+  printf "%-12s %-12s %-28s %10s %10s %12s %8s %10s %12s %12s\n" \
+    "Records" "Input(MB)" "Program" "Wall(s)" "CPU(s)" "CPU/Wall" \
+    "E-Run" "E-Dur(s)" "E-Total(J)" "E-AvgW"
+  printf "%-12s %-12s %-28s %10s %10s %12s %8s %10s %12s %12s\n" \
+    "-------" "----------" "-------" "-------" "------" "--------" \
+    "-----" "--------" "----------" "------"
   for count in "${COUNTS[@]}"; do
     for program in "${PROGRAMS[@]}"; do
       key="${count},${program}"
       if [[ -n "${wall_results[$key]:-}" ]]; then
         local wall="${wall_results[$key]}"
         local cpu="${cpu_results[$key]}"
+        local energy_duration="${energy_duration_results[$key]:-null}"
+        local energy_total="${energy_total_results[$key]:-null}"
+        local energy_avg_total="${energy_avg_total_results[$key]:-null}"
+        local energy_used="${energy_used_results[$key]:-0}"
         local ratio
+        local energy_used_fmt
+        local energy_duration_fmt energy_total_fmt energy_avg_total_fmt
         ratio=$(awk -v w="$wall" -v c="$cpu" 'BEGIN { if (w > 0) printf "%.1fx", c/w; else print "N/A" }')
-        printf "%-12s %-12s %-28s %10s %10s %12s\n" \
-          "$count" "${input_sizes[$count]}" "$program" "$wall" "$cpu" "$ratio"
+        energy_used_fmt=$(json_bool "$energy_used")
+        energy_duration_fmt=$(fmt_optional_number "$energy_duration" 3)
+        energy_total_fmt=$(fmt_optional_number "$energy_total" 3)
+        energy_avg_total_fmt=$(fmt_optional_number "$energy_avg_total" 3)
+        printf "%-12s %-12s %-28s %10s %10s %12s %8s %10s %12s %12s\n" \
+          "$count" "${input_sizes[$count]}" "$program" "$wall" "$cpu" "$ratio" \
+          "$energy_used_fmt" "$energy_duration_fmt" "$energy_total_fmt" "$energy_avg_total_fmt"
       fi
     done
   done
@@ -433,7 +633,14 @@ PY
     echo "    \"date\": \"$(date -Iseconds)\","
     echo "    \"read_length\": ${READ_LENGTH},"
     echo "    \"hostname\": \"$(hostname)\","
-    echo "    \"uname\": \"$(uname -srm)\""
+    echo "    \"uname\": \"$(uname -srm)\","
+    echo "    \"energy_run_available\": $(json_bool "$ENERGY_RUN_AVAILABLE"),"
+    if [[ "$ENERGY_RUN_AVAILABLE" -eq 1 ]]; then
+      echo "    \"energy_run_path\": \"$(json_escape "$ENERGY_RUN_BIN")\","
+    else
+      echo '    "energy_run_path": null,'
+    fi
+    echo "    \"energy_run_disable_gpu\": $(json_bool "$ENERGY_RUN_DISABLE_GPU")"
     echo '  },'
     echo '  "programs": ['
     local first_prog=1
@@ -453,9 +660,19 @@ PY
           if [[ $first_entry -eq 0 ]]; then echo ','; fi
           local wall="${wall_results[$key]}"
           local cpu="${cpu_results[$key]}"
+          local energy_used="${energy_used_results[$key]:-0}"
+          local energy_duration="${energy_duration_results[$key]:-null}"
+          local energy_cpu="${energy_cpu_results[$key]:-null}"
+          local energy_gpu="${energy_gpu_results[$key]:-null}"
+          local energy_total="${energy_total_results[$key]:-null}"
+          local energy_kwh="${energy_kwh_results[$key]:-null}"
+          local energy_avg_cpu="${energy_avg_cpu_results[$key]:-null}"
+          local energy_avg_gpu="${energy_avg_gpu_results[$key]:-null}"
+          local energy_avg_total="${energy_avg_total_results[$key]:-null}"
+          local energy_exit="${energy_exit_results[$key]:-null}"
           local ratio
           ratio=$(awk -v w="$wall" -v c="$cpu" 'BEGIN { if (w > 0) printf "%.1f", c/w; else print "0" }')
-          echo -n "    {\"records\": ${count}, \"input_mb\": ${input_sizes[$count]}, \"program\": \"${program}\", \"wall_s\": ${wall}, \"cpu_s\": ${cpu}, \"cpu_wall_ratio\": ${ratio}}"
+          echo -n "    {\"records\": ${count}, \"input_mb\": ${input_sizes[$count]}, \"program\": \"${program}\", \"wall_s\": ${wall}, \"cpu_s\": ${cpu}, \"cpu_wall_ratio\": ${ratio}, \"execution\": {\"energy_run_used\": $(json_bool "$energy_used"), \"energy\": {\"duration_s\": ${energy_duration}, \"cpu_energy_j\": ${energy_cpu}, \"gpu_energy_j\": ${energy_gpu}, \"total_energy_j\": ${energy_total}, \"total_energy_kwh\": ${energy_kwh}, \"avg_cpu_power_w\": ${energy_avg_cpu}, \"avg_gpu_power_w\": ${energy_avg_gpu}, \"avg_total_power_w\": ${energy_avg_total}, \"exit_code\": ${energy_exit}}}}"
           first_entry=0
         fi
       done
@@ -469,7 +686,7 @@ PY
         if [[ $first_warn -eq 0 ]]; then echo ','; fi
         # Escape quotes in warning text
         local escaped
-        escaped=$(echo "$warning" | sed 's/"/\\"/g')
+        escaped=$(json_escape "$warning")
         echo -n "    \"${escaped}\""
         first_warn=0
       done
