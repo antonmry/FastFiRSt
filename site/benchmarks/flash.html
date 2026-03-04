@@ -163,6 +163,8 @@ function renderMetadata() {
   if (m.hostname) parts.push(m.hostname);
   if (m.uname) parts.push(m.uname);
   if (m.read_length) parts.push('Read length: ' + m.read_length + 'bp');
+  if (m.parallel_threads) parts.push('Parallel threads: ' + m.parallel_threads);
+  if (m.parallel_batch_size) parts.push('Parallel batch: ' + m.parallel_batch_size);
   if (m.energy_run_available === true) parts.push('energy-run: enabled');
   if (m.energy_run_available === false) parts.push('energy-run: unavailable');
   document.getElementById('metadata').textContent = parts.join(' | ');

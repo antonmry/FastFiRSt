@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-const IO_BUF_SIZE: usize = 256 * 1024;
+const IO_BUF_SIZE: usize = 1024 * 1024;
 const IO_WRITE_BUF_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -233,11 +233,74 @@ pub struct CombineOutcome {
 
 pub const DEFAULT_BATCH_SIZE: usize = 4096;
 pub const DEFAULT_NUM_THREADS: usize = 2;
+#[cfg(feature = "parallel")]
+const PARALLEL_PIPELINE_DEPTH: usize = 4;
 
 #[derive(Debug, Clone)]
 pub enum PairOutcome {
     Combined(FastqRecord),
     NotCombined(FastqRecord, FastqRecord),
+}
+
+#[cfg(feature = "parallel")]
+enum ParallelPairDecision {
+    Combined(FastqRecord),
+    NotCombined,
+}
+
+#[cfg(feature = "parallel")]
+struct RecordBatch {
+    records: Vec<FastqRecord>,
+    len: usize,
+}
+
+#[cfg(feature = "parallel")]
+#[derive(Default)]
+struct ReaderProfile {
+    wait_batch_ns: u64,
+    read_ns: u64,
+    send_filled_ns: u64,
+    batches: u64,
+    records: u64,
+}
+
+#[cfg(feature = "parallel")]
+#[derive(Default)]
+struct WriterProfile {
+    wait_result_ns: u64,
+    write_ns: u64,
+    return_batch_ns: u64,
+    batches: u64,
+    records: u64,
+}
+
+#[cfg(feature = "parallel")]
+#[derive(Default)]
+struct MainProfile {
+    wait_filled_ns: u64,
+    compute_ns: u64,
+    send_result_ns: u64,
+    batches: u64,
+    records: u64,
+}
+
+#[cfg(feature = "parallel")]
+#[inline]
+fn elapsed_ns(start: std::time::Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+#[cfg(feature = "parallel")]
+fn new_record_batch(batch_size: usize) -> RecordBatch {
+    let mut records = Vec::with_capacity(batch_size);
+    for _ in 0..batch_size {
+        records.push(FastqRecord {
+            tag: String::with_capacity(64),
+            seq: Vec::with_capacity(256),
+            qual: Vec::with_capacity(256),
+        });
+    }
+    RecordBatch { records, len: 0 }
 }
 
 pub fn combine_pair_from_strs(
@@ -298,32 +361,20 @@ pub fn compute_pair(
     }
 }
 
-/// Like `compute_pair` but takes ownership — avoids cloning for `NotCombined`.
-/// Uses a thread-local scratch buffer for the reverse complement.
-fn compute_pair_owned(
-    read1: FastqRecord,
-    read2: FastqRecord,
+#[cfg(feature = "parallel")]
+fn compute_pair_decision_with_scratch(
+    read1: &FastqRecord,
+    read2: &FastqRecord,
     params: &CombineParams,
-) -> PairOutcome {
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<FastqRecord> = const { std::cell::RefCell::new(FastqRecord {
-            tag: String::new(),
-            seq: Vec::new(),
-            qual: Vec::new(),
-        }) };
+    scratch: &mut FastqRecord,
+) -> ParallelPairDecision {
+    reverse_complement_into(read2, scratch);
+
+    if let Some(combined) = combine_pair(read1, scratch, params) {
+        ParallelPairDecision::Combined(combined)
+    } else {
+        ParallelPairDecision::NotCombined
     }
-
-    SCRATCH.with(|cell| {
-        let mut scratch = cell.borrow_mut();
-        reverse_complement_into(&read2, &mut scratch);
-
-        if let Some(mut combined) = combine_pair(&read1, &scratch, params) {
-            combined.tag = combined_tag(&read1);
-            PairOutcome::Combined(combined)
-        } else {
-            PairOutcome::NotCombined(read1, read2)
-        }
-    })
 }
 
 pub fn merge_fastq_files(
@@ -366,7 +417,7 @@ pub fn merge_fastq_files(
         seq: Vec::new(),
         qual: Vec::new(),
     };
-    let mut qual_buf = Vec::new();
+    let mut record_buf = Vec::new();
 
     while let Some((r1, r2)) = pair_reader.next_pair()? {
         process_pair_with_scratch(
@@ -377,7 +428,7 @@ pub fn merge_fastq_files(
             &mut out_not1,
             &mut out_not2,
             &mut scratch,
-            &mut qual_buf,
+            &mut record_buf,
         )?;
     }
 
@@ -407,6 +458,7 @@ pub fn merge_fastq_files_parallel(
     params.validate()?;
     ensure!(batch_size > 0, "batch-size must be >= 1");
     ensure!(num_threads > 0, "num-threads must be >= 1");
+    let profile_enabled = std::env::var_os("FLASH_PROFILE_PARALLEL").is_some();
 
     let forward = forward.as_ref();
     let reverse = reverse.as_ref();
@@ -415,26 +467,26 @@ pub fn merge_fastq_files_parallel(
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create output directory {:?}", output_dir))?;
 
-    let pair_reader = FastqPairReader::from_paths(forward, reverse, params.phred_offset)?;
+    let forward_path = forward.to_path_buf();
+    let reverse_path = reverse.to_path_buf();
+    let phred_offset = params.phred_offset;
 
     let ext_path = output_dir.join(format!("{}.extendedFrags.fastq", output_prefix));
     let not1_path = output_dir.join(format!("{}.notCombined_1.fastq", output_prefix));
     let not2_path = output_dir.join(format!("{}.notCombined_2.fastq", output_prefix));
 
-    let mut out_extended = BufWriter::with_capacity(
+    let out_extended = BufWriter::with_capacity(
         IO_WRITE_BUF_SIZE,
         File::create(&ext_path).with_context(|| format!("failed to create {:?}", ext_path))?,
     );
-    let mut out_not1 = BufWriter::with_capacity(
+    let out_not1 = BufWriter::with_capacity(
         IO_WRITE_BUF_SIZE,
         File::create(&not1_path).with_context(|| format!("failed to create {:?}", not1_path))?,
     );
-    let mut out_not2 = BufWriter::with_capacity(
+    let out_not2 = BufWriter::with_capacity(
         IO_WRITE_BUF_SIZE,
         File::create(&not2_path).with_context(|| format!("failed to create {:?}", not2_path))?,
     );
-
-    let mut qual_buf = Vec::new();
 
     // Build a custom Rayon pool with limited threads to reduce synchronization overhead.
     let pool = rayon::ThreadPoolBuilder::new()
@@ -442,65 +494,279 @@ pub fn merge_fastq_files_parallel(
         .build()
         .context("failed to build Rayon thread pool")?;
 
-    // Double-buffered pipeline: a dedicated reader thread fills the next batch
-    // while the main thread processes + writes the current batch.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(FastqRecord, FastqRecord)>>(1);
+    // Reader threads: parse each FASTQ in parallel and stream reusable batches.
+    let (r1_filled_tx, r1_filled_rx) =
+        std::sync::mpsc::sync_channel::<RecordBatch>(PARALLEL_PIPELINE_DEPTH);
+    let (r2_filled_tx, r2_filled_rx) =
+        std::sync::mpsc::sync_channel::<RecordBatch>(PARALLEL_PIPELINE_DEPTH);
+    let (r1_free_tx, r1_free_rx) =
+        std::sync::mpsc::sync_channel::<RecordBatch>(PARALLEL_PIPELINE_DEPTH);
+    let (r2_free_tx, r2_free_rx) =
+        std::sync::mpsc::sync_channel::<RecordBatch>(PARALLEL_PIPELINE_DEPTH);
 
-    let reader_handle = std::thread::spawn(move || -> Result<()> {
-        let mut reader = pair_reader;
-        loop {
-            let mut batch = Vec::with_capacity(batch_size);
-            for _ in 0..batch_size {
-                match reader.next_pair()? {
-                    Some(pair) => batch.push(pair),
-                    None => break,
-                }
-            }
-            if batch.is_empty() {
-                break;
-            }
-            if tx.send(batch).is_err() {
-                break; // receiver dropped
-            }
-        }
-        Ok(())
-    });
-
-    // Main thread: process batches with Rayon pool + write results
-    for batch in rx {
-        let outcomes: Vec<PairOutcome> = pool.install(|| {
-            batch
-                .into_par_iter()
-                .map(|(read1, read2)| compute_pair_owned(read1, read2, params))
-                .collect()
-        });
-
-        for outcome in outcomes {
-            write_outcome(
-                outcome,
-                params.phred_offset,
-                &mut out_extended,
-                &mut out_not1,
-                &mut out_not2,
-                &mut qual_buf,
-            )?;
-        }
+    for _ in 0..PARALLEL_PIPELINE_DEPTH {
+        // Seed batch pools for each reader.
+        r1_free_tx
+            .send(new_record_batch(batch_size))
+            .context("failed to initialize reader 1 batch pool")?;
+        r2_free_tx
+            .send(new_record_batch(batch_size))
+            .context("failed to initialize reader 2 batch pool")?;
     }
 
-    // Wait for reader thread and propagate any error
-    reader_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
+    let spawn_reader = |path: PathBuf,
+                        filled_tx: std::sync::mpsc::SyncSender<RecordBatch>,
+                        free_rx: std::sync::mpsc::Receiver<RecordBatch>| {
+        std::thread::spawn(move || -> Result<ReaderProfile> {
+            let file =
+                File::open(&path).with_context(|| format!("failed to open FASTQ {:?}", path))?;
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+                }
+            }
 
-    out_extended
-        .flush()
-        .context("failed to flush extendedFrags writer")?;
-    out_not1
-        .flush()
-        .context("failed to flush notCombined_1 writer")?;
-    out_not2
-        .flush()
-        .context("failed to flush notCombined_2 writer")?;
+            let mut reader = BufReader::with_capacity(IO_BUF_SIZE, file);
+            let mut line_buf = Vec::with_capacity(1024);
+            let mut profile = ReaderProfile::default();
+
+            loop {
+                let wait_start = profile_enabled.then(std::time::Instant::now);
+                let mut batch = match free_rx.recv() {
+                    Ok(batch) => batch,
+                    Err(_) => break,
+                };
+                if let Some(start) = wait_start {
+                    profile.wait_batch_ns += elapsed_ns(start);
+                }
+
+                let read_start = profile_enabled.then(std::time::Instant::now);
+                let mut filled = 0usize;
+                for record in batch.records.iter_mut() {
+                    if read_fastq_record_into(
+                        &mut reader,
+                        &path,
+                        phred_offset,
+                        &mut line_buf,
+                        record,
+                    )? {
+                        filled += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(start) = read_start {
+                    profile.read_ns += elapsed_ns(start);
+                }
+
+                if filled == 0 {
+                    break;
+                }
+
+                let reached_eof = filled < batch.records.len();
+                batch.len = filled;
+                profile.batches += 1;
+                profile.records += filled as u64;
+
+                let send_start = profile_enabled.then(std::time::Instant::now);
+                if filled_tx.send(batch).is_err() {
+                    break;
+                }
+                if let Some(start) = send_start {
+                    profile.send_filled_ns += elapsed_ns(start);
+                }
+                if reached_eof {
+                    break;
+                }
+            }
+
+            Ok(profile)
+        })
+    };
+    let reader1_handle = spawn_reader(forward_path, r1_filled_tx, r1_free_rx);
+    let reader2_handle = spawn_reader(reverse_path, r2_filled_tx, r2_free_rx);
+
+    // Writer thread: write current batch while main thread computes next batch.
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<(RecordBatch, RecordBatch, Vec<ParallelPairDecision>)>(2);
+    let phred_offset = params.phred_offset;
+
+    let writer_handle = std::thread::spawn(move || -> Result<WriterProfile> {
+        let mut out_extended = out_extended;
+        let mut out_not1 = out_not1;
+        let mut out_not2 = out_not2;
+        let mut record_buf = Vec::new();
+        let mut profile = WriterProfile::default();
+
+        loop {
+            let wait_start = profile_enabled.then(std::time::Instant::now);
+            let (mut batch1, mut batch2, decisions) = match result_rx.recv() {
+                Ok(item) => item,
+                Err(_) => break,
+            };
+            if let Some(start) = wait_start {
+                profile.wait_result_ns += elapsed_ns(start);
+            }
+
+            let write_start = profile_enabled.then(std::time::Instant::now);
+            for (idx, decision) in decisions.into_iter().enumerate() {
+                let read1 = &batch1.records[idx];
+                let read2 = &batch2.records[idx];
+                match decision {
+                    ParallelPairDecision::Combined(combined) => {
+                        write_combined_fastq(
+                            &mut out_extended,
+                            read1.tag(),
+                            &combined,
+                            phred_offset,
+                            &mut record_buf,
+                        )?;
+                    }
+                    ParallelPairDecision::NotCombined => {
+                        write_fastq(&mut out_not1, read1, phred_offset, &mut record_buf)?;
+                        write_fastq(&mut out_not2, read2, phred_offset, &mut record_buf)?;
+                    }
+                }
+            }
+            if let Some(start) = write_start {
+                profile.write_ns += elapsed_ns(start);
+            }
+            profile.batches += 1;
+            profile.records += batch1.len as u64;
+
+            batch1.len = 0;
+            batch2.len = 0;
+            let return_start = profile_enabled.then(std::time::Instant::now);
+            // Readers may already have exited after reaching EOF; returning batches is best-effort.
+            let _ = r1_free_tx.send(batch1);
+            let _ = r2_free_tx.send(batch2);
+            if let Some(start) = return_start {
+                profile.return_batch_ns += elapsed_ns(start);
+            }
+        }
+
+        out_extended
+            .flush()
+            .context("failed to flush extendedFrags writer")?;
+        out_not1
+            .flush()
+            .context("failed to flush notCombined_1 writer")?;
+        out_not2
+            .flush()
+            .context("failed to flush notCombined_2 writer")?;
+        Ok(profile)
+    });
+
+    // Main thread: pair same-index records from both readers, compute decisions in parallel,
+    // then hand off to writer thread.
+    let mut pairing_error: Option<anyhow::Error> = None;
+    let mut main_profile = MainProfile::default();
+    loop {
+        let wait_start = profile_enabled.then(std::time::Instant::now);
+        let batch1 = r1_filled_rx.recv();
+        let batch2 = r2_filled_rx.recv();
+        if let Some(start) = wait_start {
+            main_profile.wait_filled_ns += elapsed_ns(start);
+        }
+        match (batch1, batch2) {
+            (Ok(batch1), Ok(batch2)) => {
+                if batch1.len != batch2.len {
+                    pairing_error = Some(anyhow::anyhow!(
+                        "FASTQ inputs have different number of records"
+                    ));
+                    break;
+                }
+
+                let len = batch1.len;
+                let compute_start = profile_enabled.then(std::time::Instant::now);
+                let decisions: Vec<ParallelPairDecision> = pool.install(|| {
+                    batch1.records[..len]
+                        .par_iter()
+                        .zip(batch2.records[..len].par_iter())
+                        .map_init(
+                            || FastqRecord {
+                                tag: String::new(),
+                                seq: Vec::new(),
+                                qual: Vec::new(),
+                            },
+                            |scratch, (read1, read2)| {
+                                compute_pair_decision_with_scratch(read1, read2, params, scratch)
+                            },
+                        )
+                        .collect()
+                });
+                if let Some(start) = compute_start {
+                    main_profile.compute_ns += elapsed_ns(start);
+                }
+                main_profile.batches += 1;
+                main_profile.records += len as u64;
+
+                let send_start = profile_enabled.then(std::time::Instant::now);
+                if result_tx.send((batch1, batch2, decisions)).is_err() {
+                    break;
+                }
+                if let Some(start) = send_start {
+                    main_profile.send_result_ns += elapsed_ns(start);
+                }
+            }
+            (Err(_), Err(_)) => break,
+            (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
+                pairing_error = Some(anyhow::anyhow!(
+                    "FASTQ inputs have different number of records"
+                ));
+                break;
+            }
+        }
+    }
+    drop(result_tx);
+    drop(r1_filled_rx);
+    drop(r2_filled_rx);
+
+    let reader1_result = reader1_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("reader_1 thread panicked"))?;
+    let reader2_result = reader2_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("reader_2 thread panicked"))?;
+    let writer_result = writer_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+
+    let reader1_profile = reader1_result?;
+    let reader2_profile = reader2_result?;
+    let writer_profile = writer_result?;
+    if let Some(err) = pairing_error {
+        return Err(err);
+    }
+
+    if profile_enabled {
+        let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
+        eprintln!(
+            concat!(
+                "[flash profile] batches={} records={}\n",
+                "  main:   wait_filled={:.3}ms compute={:.3}ms send_result={:.3}ms\n",
+                "  read1:  wait_batch={:.3}ms read={:.3}ms send_filled={:.3}ms\n",
+                "  read2:  wait_batch={:.3}ms read={:.3}ms send_filled={:.3}ms\n",
+                "  writer: wait_result={:.3}ms write={:.3}ms return_batch={:.3}ms"
+            ),
+            main_profile.batches,
+            main_profile.records,
+            to_ms(main_profile.wait_filled_ns),
+            to_ms(main_profile.compute_ns),
+            to_ms(main_profile.send_result_ns),
+            to_ms(reader1_profile.wait_batch_ns),
+            to_ms(reader1_profile.read_ns),
+            to_ms(reader1_profile.send_filled_ns),
+            to_ms(reader2_profile.wait_batch_ns),
+            to_ms(reader2_profile.read_ns),
+            to_ms(reader2_profile.send_filled_ns),
+            to_ms(writer_profile.wait_result_ns),
+            to_ms(writer_profile.write_ns),
+            to_ms(writer_profile.return_batch_ns),
+        );
+    }
 
     Ok(())
 }
@@ -514,39 +780,23 @@ fn process_pair_with_scratch<W: Write>(
     out_not1: &mut W,
     out_not2: &mut W,
     scratch: &mut FastqRecord,
-    qual_buf: &mut Vec<u8>,
+    record_buf: &mut Vec<u8>,
 ) -> Result<()> {
     reverse_complement_into(read2, scratch);
 
-    if let Some(mut combined) = combine_pair(read1, scratch, params) {
-        combined.tag = combined_tag(read1);
-        write_fastq(out_extended, &combined, params.phred_offset, qual_buf)?;
+    if let Some(combined) = combine_pair(read1, scratch, params) {
+        write_combined_fastq(
+            out_extended,
+            read1.tag(),
+            &combined,
+            params.phred_offset,
+            record_buf,
+        )?;
     } else {
-        write_fastq(out_not1, read1, params.phred_offset, qual_buf)?;
-        write_fastq(out_not2, read2, params.phred_offset, qual_buf)?;
+        write_fastq(out_not1, read1, params.phred_offset, record_buf)?;
+        write_fastq(out_not2, read2, params.phred_offset, record_buf)?;
     }
 
-    Ok(())
-}
-
-#[cfg(feature = "parallel")]
-fn write_outcome<W: Write>(
-    outcome: PairOutcome,
-    phred_offset: u8,
-    out_extended: &mut W,
-    out_not1: &mut W,
-    out_not2: &mut W,
-    qual_buf: &mut Vec<u8>,
-) -> Result<()> {
-    match outcome {
-        PairOutcome::Combined(combined) => {
-            write_fastq(out_extended, &combined, phred_offset, qual_buf)?
-        }
-        PairOutcome::NotCombined(read1, read2) => {
-            write_fastq(out_not1, &read1, phred_offset, qual_buf)?;
-            write_fastq(out_not2, &read2, phred_offset, qual_buf)?;
-        }
-    }
     Ok(())
 }
 
@@ -616,17 +866,21 @@ fn read_fastq_record<R: BufRead>(
         *b = canonical_base(*b);
     }
 
-    // Convert quality in-place
-    for (idx, q) in qual_buf.iter_mut().enumerate() {
-        if phred_offset > 0 && *q < phred_offset {
-            bail!(
-                "quality char below PHRED offset ({}) at position {} in {:?}",
-                phred_offset,
-                idx,
-                source
-            );
+    // Convert quality in-place.
+    if phred_offset == 0 {
+        // No conversion required.
+    } else {
+        for (idx, q) in qual_buf.iter_mut().enumerate() {
+            if *q < phred_offset {
+                bail!(
+                    "quality char below PHRED offset ({}) at position {} in {:?}",
+                    phred_offset,
+                    idx,
+                    source
+                );
+            }
+            *q -= phred_offset;
         }
-        *q = q.saturating_sub(phred_offset);
     }
 
     // Take ownership by swapping with empty vecs, avoiding clone
@@ -634,6 +888,70 @@ fn read_fastq_record<R: BufRead>(
     let qual = std::mem::take(qual_buf);
 
     Ok(Some(FastqRecord { tag, seq, qual }))
+}
+
+#[cfg(feature = "parallel")]
+fn read_fastq_record_into<R: BufRead>(
+    reader: &mut R,
+    source: &Path,
+    phred_offset: u8,
+    line_buf: &mut Vec<u8>,
+    out: &mut FastqRecord,
+) -> Result<bool> {
+    if read_line_bytes(reader, line_buf)? == 0 {
+        return Ok(false);
+    }
+    ensure!(
+        !line_buf.is_empty() && line_buf[0] == b'@',
+        "invalid FASTQ tag line in {:?}",
+        source,
+    );
+    out.tag.clear();
+    out.tag.push_str(&String::from_utf8_lossy(line_buf));
+
+    if read_line_bytes(reader, &mut out.seq)? == 0 {
+        bail!("unexpected EOF reading sequence in {:?}", source);
+    }
+
+    if read_line_bytes(reader, line_buf)? == 0 {
+        bail!("unexpected EOF reading '+' separator in {:?}", source);
+    }
+    ensure!(
+        !line_buf.is_empty() && line_buf[0] == b'+',
+        "invalid FASTQ '+' separator in {:?}",
+        source,
+    );
+
+    if read_line_bytes(reader, &mut out.qual)? == 0 {
+        bail!("unexpected EOF reading quality in {:?}", source);
+    }
+
+    ensure!(
+        out.seq.len() == out.qual.len(),
+        "sequence and quality lengths differ in {:?}: {} vs {}",
+        source,
+        out.seq.len(),
+        out.qual.len()
+    );
+
+    for b in out.seq.iter_mut() {
+        *b = canonical_base(*b);
+    }
+
+    if phred_offset != 0 {
+        for (idx, q) in out.qual.iter_mut().enumerate() {
+            if *q < phred_offset {
+                bail!(
+                    "quality char below PHRED offset ({}) at position {} in {:?}",
+                    phred_offset,
+                    idx,
+                    source
+                );
+            }
+            *q -= phred_offset;
+        }
+    }
+    Ok(true)
 }
 
 /// Lookup table: maps any byte to its canonical uppercase base (A/C/G/T/N).
@@ -700,6 +1018,24 @@ fn combine_pair(
     read2_rev: &FastqRecord,
     params: &CombineParams,
 ) -> Option<FastqRecord> {
+    let (candidate, status) = best_alignment(read1, read2_rev, params)?;
+    let (first, second) = match status {
+        CombineStatus::CombinedInnie => (read1, read2_rev),
+        CombineStatus::CombinedOutie => (read2_rev, read1),
+    };
+    Some(generate_combined_read(
+        first,
+        second,
+        candidate.position,
+        params,
+    ))
+}
+
+fn best_alignment(
+    read1: &FastqRecord,
+    read2_rev: &FastqRecord,
+    params: &CombineParams,
+) -> Option<(AlignmentCandidate, CombineStatus)> {
     let mut best: Option<(AlignmentCandidate, CombineStatus)> =
         evaluate_alignment(read1, read2_rev, params)
             .map(|candidate| (candidate, CombineStatus::CombinedInnie));
@@ -720,17 +1056,7 @@ fn combine_pair(
         }
     }
 
-    let (candidate, status) = best?;
-    let (first, second) = match status {
-        CombineStatus::CombinedInnie => (read1, read2_rev),
-        CombineStatus::CombinedOutie => (read2_rev, read1),
-    };
-    Some(generate_combined_read(
-        first,
-        second,
-        candidate.position,
-        params,
-    ))
+    best
 }
 
 fn evaluate_alignment(
@@ -763,13 +1089,33 @@ fn evaluate_alignment(
             continue;
         }
 
-        let stats = compute_mismatch_stats(
-            &first.seq[i..first.len()],
-            &second.seq[..overlap_len],
-            &first.qual[i..first.len()],
-            &second.qual[..overlap_len],
-            have_n,
-        );
+        let score_len = overlap_len.min(params.max_overlap).max(1);
+        let stats = if have_n {
+            compute_mismatch_stats(
+                &first.seq[i..first.len()],
+                &second.seq[..overlap_len],
+                &first.qual[i..first.len()],
+                &second.qual[..overlap_len],
+                true,
+            )
+        } else {
+            // Early-reject impossible candidates: once mismatch count exceeds the
+            // tighter of (current best density) and configured max density, this
+            // alignment cannot win and we stop scanning it.
+            let density_cap = best_density.min(params.max_mismatch_density);
+            let max_mismatches = (density_cap * score_len as f32).ceil() as u32;
+            let stats = compute_mismatch_stats_no_n_limited(
+                &first.seq[i..first.len()],
+                &second.seq[..overlap_len],
+                &first.qual[i..first.len()],
+                &second.qual[..overlap_len],
+                max_mismatches,
+            );
+            if stats.mismatches > max_mismatches {
+                continue;
+            }
+            stats
+        };
 
         if stats.effective_len >= params.min_overlap {
             let score_len = (stats.effective_len.min(params.max_overlap)).max(1) as f32;
@@ -1005,6 +1351,228 @@ fn compute_mismatch_stats_no_n(
     compute_mismatch_stats_no_n_scalar(seq1, seq2, qual1, qual2)
 }
 
+/// Same as `compute_mismatch_stats_no_n`, but stops as soon as mismatches
+/// exceed `max_mismatches`.
+#[inline(always)]
+fn compute_mismatch_stats_no_n_limited(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+    max_mismatches: u32,
+) -> MismatchStats {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            // SAFETY: we just checked that SSE2 is available
+            return unsafe {
+                compute_mismatch_stats_no_n_sse2_limited(seq1, seq2, qual1, qual2, max_mismatches)
+            };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: we just checked that NEON is available
+            return unsafe {
+                compute_mismatch_stats_no_n_neon_limited(seq1, seq2, qual1, qual2, max_mismatches)
+            };
+        }
+    }
+    compute_mismatch_stats_no_n_scalar_limited(seq1, seq2, qual1, qual2, max_mismatches)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn compute_mismatch_stats_no_n_sse2_limited(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+    max_mismatches: u32,
+) -> MismatchStats {
+    use std::arch::x86_64::*;
+
+    let len = seq1.len();
+    let mut mismatches: u32 = 0;
+    let mut mismatch_qual_total: u32 = 0;
+
+    let chunks = len / 16;
+    let remainder = len % 16;
+
+    for chunk in 0..chunks {
+        let base = chunk * 16;
+        let s1 = _mm_loadu_si128(seq1.as_ptr().add(base) as *const __m128i);
+        let s2 = _mm_loadu_si128(seq2.as_ptr().add(base) as *const __m128i);
+        let eq = _mm_cmpeq_epi8(s1, s2);
+        let eq_mask = _mm_movemask_epi8(eq) as u32;
+        let diff_mask = (!eq_mask) & 0xFFFF;
+        let chunk_mismatches = diff_mask.count_ones();
+        mismatches += chunk_mismatches;
+        if mismatches > max_mismatches {
+            return MismatchStats {
+                effective_len: len,
+                mismatches,
+                mismatch_qual_total,
+            };
+        }
+
+        if chunk_mismatches > 0 {
+            let q1 = _mm_loadu_si128(qual1.as_ptr().add(base) as *const __m128i);
+            let q2 = _mm_loadu_si128(qual2.as_ptr().add(base) as *const __m128i);
+            let qmin = _mm_min_epu8(q1, q2);
+            let qmin_masked = _mm_andnot_si128(eq, qmin);
+            let zero = _mm_setzero_si128();
+            let sad = _mm_sad_epu8(qmin_masked, zero);
+            let lo = _mm_extract_epi16::<0>(sad) as u32;
+            let hi = _mm_extract_epi16::<4>(sad) as u32;
+            mismatch_qual_total += lo + hi;
+        }
+    }
+
+    let tail = chunks * 16;
+    for j in 0..remainder {
+        let i = tail + j;
+        let s1 = *seq1.get_unchecked(i);
+        let s2 = *seq2.get_unchecked(i);
+        if s1 != s2 {
+            mismatches += 1;
+            if mismatches > max_mismatches {
+                return MismatchStats {
+                    effective_len: len,
+                    mismatches,
+                    mismatch_qual_total,
+                };
+            }
+            let q1 = *qual1.get_unchecked(i);
+            let q2 = *qual2.get_unchecked(i);
+            mismatch_qual_total += q1.min(q2) as u32;
+        }
+    }
+
+    MismatchStats {
+        effective_len: len,
+        mismatches,
+        mismatch_qual_total,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn compute_mismatch_stats_no_n_neon_limited(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+    max_mismatches: u32,
+) -> MismatchStats {
+    use std::arch::aarch64::*;
+
+    let len = seq1.len();
+    let mut mismatches: u32 = 0;
+    let mut mismatch_qual_total: u32 = 0;
+
+    let chunks = len / 16;
+    let remainder = len % 16;
+
+    for chunk in 0..chunks {
+        let base = chunk * 16;
+        let s1 = vld1q_u8(seq1.as_ptr().add(base));
+        let s2 = vld1q_u8(seq2.as_ptr().add(base));
+        let eq = vceqq_u8(s1, s2);
+        let neq = vmvnq_u8(eq);
+        let bit_counts = vcntq_u8(neq);
+        let sum16 = vpaddlq_u8(bit_counts);
+        let sum32 = vpaddlq_u16(sum16);
+        let sum64 = vpaddlq_u32(sum32);
+        let total_bits = vgetq_lane_u64(sum64, 0) + vgetq_lane_u64(sum64, 1);
+        let chunk_mismatches = (total_bits / 8) as u32;
+        mismatches += chunk_mismatches;
+        if mismatches > max_mismatches {
+            return MismatchStats {
+                effective_len: len,
+                mismatches,
+                mismatch_qual_total,
+            };
+        }
+
+        if chunk_mismatches > 0 {
+            let q1 = vld1q_u8(qual1.as_ptr().add(base));
+            let q2 = vld1q_u8(qual2.as_ptr().add(base));
+            let qmin = vminq_u8(q1, q2);
+            let qmin_masked = vandq_u8(neq, qmin);
+            let qsum16 = vpaddlq_u8(qmin_masked);
+            let qsum32 = vpaddlq_u16(qsum16);
+            let qsum64 = vpaddlq_u32(qsum32);
+            let qual_sum = vgetq_lane_u64(qsum64, 0) + vgetq_lane_u64(qsum64, 1);
+            mismatch_qual_total += qual_sum as u32;
+        }
+    }
+
+    let tail = chunks * 16;
+    for j in 0..remainder {
+        let i = tail + j;
+        let s1 = *seq1.get_unchecked(i);
+        let s2 = *seq2.get_unchecked(i);
+        if s1 != s2 {
+            mismatches += 1;
+            if mismatches > max_mismatches {
+                return MismatchStats {
+                    effective_len: len,
+                    mismatches,
+                    mismatch_qual_total,
+                };
+            }
+            let q1 = *qual1.get_unchecked(i);
+            let q2 = *qual2.get_unchecked(i);
+            mismatch_qual_total += q1.min(q2) as u32;
+        }
+    }
+
+    MismatchStats {
+        effective_len: len,
+        mismatches,
+        mismatch_qual_total,
+    }
+}
+
+#[inline(always)]
+fn compute_mismatch_stats_no_n_scalar_limited(
+    seq1: &[u8],
+    seq2: &[u8],
+    qual1: &[u8],
+    qual2: &[u8],
+    max_mismatches: u32,
+) -> MismatchStats {
+    let len = seq1.len();
+    let mut mismatches: u32 = 0;
+    let mut mismatch_qual_total: u32 = 0;
+
+    for i in 0..len {
+        let s1 = unsafe { *seq1.get_unchecked(i) };
+        let s2 = unsafe { *seq2.get_unchecked(i) };
+        if s1 != s2 {
+            mismatches += 1;
+            if mismatches > max_mismatches {
+                return MismatchStats {
+                    effective_len: len,
+                    mismatches,
+                    mismatch_qual_total,
+                };
+            }
+            let q1 = unsafe { *qual1.get_unchecked(i) };
+            let q2 = unsafe { *qual2.get_unchecked(i) };
+            mismatch_qual_total += q1.min(q2) as u32;
+        }
+    }
+
+    MismatchStats {
+        effective_len: len,
+        mismatches,
+        mismatch_qual_total,
+    }
+}
+
 fn compute_mismatch_stats(
     seq1: &[u8],
     seq2: &[u8],
@@ -1042,12 +1610,30 @@ fn generate_combined_read(
     overlap_begin: usize,
     params: &CombineParams,
 ) -> FastqRecord {
+    let mut out = FastqRecord {
+        tag: String::new(),
+        seq: Vec::new(),
+        qual: Vec::new(),
+    };
+    generate_combined_read_into(read1, read2, overlap_begin, params, &mut out);
+    out
+}
+
+fn generate_combined_read_into(
+    read1: &FastqRecord,
+    read2: &FastqRecord,
+    overlap_begin: usize,
+    params: &CombineParams,
+    out: &mut FastqRecord,
+) {
     let overlap_len = read1.len() - overlap_begin;
     let remaining_len = read2.len().saturating_sub(overlap_len);
     let combined_len = read1.len() + remaining_len;
 
-    let mut seq = Vec::with_capacity(combined_len);
-    let mut qual = Vec::with_capacity(combined_len);
+    out.seq.clear();
+    out.qual.clear();
+    out.seq.reserve(combined_len);
+    out.qual.reserve(combined_len);
 
     for idx in 0..overlap_begin {
         let base = read1.seq[idx];
@@ -1056,8 +1642,8 @@ fn generate_combined_read(
         } else {
             base
         };
-        seq.push(base);
-        qual.push(read1.qual[idx]);
+        out.seq.push(base);
+        out.qual.push(read1.qual[idx]);
     }
 
     for offset in 0..overlap_len {
@@ -1067,8 +1653,8 @@ fn generate_combined_read(
         let q2 = read2.qual[offset];
 
         if base1 == base2 {
-            seq.push(base1);
-            qual.push(q1.max(q2));
+            out.seq.push(base1);
+            out.qual.push(q1.max(q2));
         } else {
             let q = if params.cap_mismatch_quals {
                 q1.min(q2).min(2)
@@ -1084,8 +1670,8 @@ fn generate_combined_read(
             } else {
                 base2
             };
-            seq.push(base);
-            qual.push(q);
+            out.seq.push(base);
+            out.qual.push(q);
         }
     }
 
@@ -1096,14 +1682,8 @@ fn generate_combined_read(
         } else {
             base
         };
-        seq.push(base);
-        qual.push(read2.qual[idx]);
-    }
-
-    FastqRecord {
-        tag: String::new(),
-        seq,
-        qual,
+        out.seq.push(base);
+        out.qual.push(read2.qual[idx]);
     }
 }
 
@@ -1124,28 +1704,63 @@ fn write_fastq<W: Write>(
     writer: &mut W,
     read: &FastqRecord,
     phred_offset: u8,
-    qual_buf: &mut Vec<u8>,
+    record_buf: &mut Vec<u8>,
 ) -> Result<()> {
+    record_buf.clear();
+    record_buf.reserve(read.tag.len() + read.seq.len() + read.qual.len() + 4);
+    record_buf.extend_from_slice(read.tag.as_bytes());
+    record_buf.push(b'\n');
+    record_buf.extend_from_slice(&read.seq);
+    record_buf.extend_from_slice(b"\n+\n");
+    append_phred_qualities(record_buf, &read.qual, phred_offset);
+    record_buf.push(b'\n');
     writer
-        .write_all(read.tag.as_bytes())
-        .context("failed to write FASTQ tag")?;
-    writer.write_all(b"\n").context("failed to write newline")?;
-    writer
-        .write_all(&read.seq)
-        .context("failed to write FASTQ sequence")?;
-    writer
-        .write_all(b"\n+\n")
-        .context("failed to write FASTQ separator")?;
+        .write_all(record_buf)
+        .context("failed to write FASTQ record")?;
+    Ok(())
+}
 
-    qual_buf.clear();
-    qual_buf.reserve(read.qual.len());
-    for &q in &read.qual {
-        qual_buf.push(q + phred_offset);
+fn append_combined_tag(out: &mut Vec<u8>, read1_tag: &str) {
+    let tag = read1_tag.as_bytes();
+    if let Some(pos) = tag.iter().rposition(|&b| b == b'/') {
+        if pos + 2 < tag.len() && tag[pos + 2] == b'#' {
+            out.extend_from_slice(&tag[..pos]);
+            out.extend_from_slice(&tag[pos + 2..]);
+        } else {
+            out.extend_from_slice(&tag[..pos]);
+        }
+    } else {
+        out.extend_from_slice(tag);
     }
+}
+
+#[inline]
+fn append_phred_qualities(out: &mut Vec<u8>, quals: &[u8], phred_offset: u8) {
+    let start = out.len();
+    out.resize(start + quals.len(), 0);
+    for (dst, &q) in out[start..].iter_mut().zip(quals.iter()) {
+        *dst = q + phred_offset;
+    }
+}
+
+fn write_combined_fastq<W: Write>(
+    writer: &mut W,
+    read1_tag: &str,
+    combined: &FastqRecord,
+    phred_offset: u8,
+    record_buf: &mut Vec<u8>,
+) -> Result<()> {
+    record_buf.clear();
+    record_buf.reserve(read1_tag.len() + combined.seq.len() + combined.qual.len() + 4);
+    append_combined_tag(record_buf, read1_tag);
+    record_buf.push(b'\n');
+    record_buf.extend_from_slice(&combined.seq);
+    record_buf.extend_from_slice(b"\n+\n");
+    append_phred_qualities(record_buf, &combined.qual, phred_offset);
+    record_buf.push(b'\n');
     writer
-        .write_all(qual_buf)
-        .context("failed to write FASTQ quality")?;
-    writer.write_all(b"\n").context("failed to write newline")?;
+        .write_all(record_buf)
+        .context("failed to write FASTQ record")?;
     Ok(())
 }
 

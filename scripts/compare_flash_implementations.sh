@@ -17,6 +17,19 @@ fi
 FASTQ_GEN_BIN="${FASTQ_GEN_BIN:-${ROOT_DIR}/target/release/fastq-gen-cli}"
 FLASH_CLI_BIN="${FLASH_CLI_BIN:-${ROOT_DIR}/target/release/flash-cli}"
 FLASH_C_BIN="${FLASH_C_BIN:-${ROOT_DIR}/bin/flash-lowercase-overhang}"
+FLASH_BENCH_PARALLEL_THREADS="${FLASH_BENCH_PARALLEL_THREADS:-}"
+FLASH_BENCH_PARALLEL_BATCH_SIZE="${FLASH_BENCH_PARALLEL_BATCH_SIZE:-16384}"
+
+if [[ -z "$FLASH_BENCH_PARALLEL_THREADS" ]]; then
+  detected_threads=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2)
+  if [[ "$detected_threads" -gt 16 ]]; then
+    FLASH_BENCH_PARALLEL_THREADS=16
+  elif [[ "$detected_threads" -lt 1 ]]; then
+    FLASH_BENCH_PARALLEL_THREADS=1
+  else
+    FLASH_BENCH_PARALLEL_THREADS="$detected_threads"
+  fi
+fi
 
 PROGRAMS=("flash-cli" "flash-cli-parallel" "flash-lowercase-overhang")
 ENERGY_RUN_BIN=""
@@ -242,7 +255,9 @@ run_flash_cli_parallel() {
     "$FLASH_CLI_BIN" "$r1" "$r2" \
     --output-dir "$output_dir" \
     --output-prefix flash \
-    --parallel
+    --parallel \
+    --threads "$FLASH_BENCH_PARALLEL_THREADS" \
+    --batch-size "$FLASH_BENCH_PARALLEL_BATCH_SIZE"
 }
 
 run_flash_c() {
@@ -551,7 +566,7 @@ PY
     energy_avg_total_results["${count},flash-lowercase-overhang"]=$c_energy_avg_total
     energy_exit_results["${count},flash-lowercase-overhang"]=$c_energy_exit
 
-    echo "Running flash-cli (parallel) for ${count} records..."
+    echo "Running flash-cli (parallel, threads=${FLASH_BENCH_PARALLEL_THREADS}, batch=${FLASH_BENCH_PARALLEL_BATCH_SIZE}) for ${count} records..."
     local cli_parallel_timing
     local p_wall p_cpu p_energy_used p_energy_duration p_energy_cpu p_energy_gpu
     local p_energy_total p_energy_kwh p_energy_avg_cpu p_energy_avg_gpu p_energy_avg_total p_energy_exit
@@ -632,6 +647,8 @@ PY
     echo '  "metadata": {'
     echo "    \"date\": \"$(date -Iseconds)\","
     echo "    \"read_length\": ${READ_LENGTH},"
+    echo "    \"parallel_threads\": ${FLASH_BENCH_PARALLEL_THREADS},"
+    echo "    \"parallel_batch_size\": ${FLASH_BENCH_PARALLEL_BATCH_SIZE},"
     echo "    \"hostname\": \"$(hostname)\","
     echo "    \"uname\": \"$(uname -srm)\","
     echo "    \"energy_run_available\": $(json_bool "$ENERGY_RUN_AVAILABLE"),"
